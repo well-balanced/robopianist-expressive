@@ -7,3 +7,4 @@ build/
 dist/
 pig_single_finger/
 .claude/
+tmp/

@@ -109,8 +109,16 @@ class Synthesizer:
     def get_samples(
         self,
         event_list: Sequence[midi_message.MidiMessage],
+        normalize: bool = True,
     ) -> np.ndarray:
-        """Synthesize a list of MIDI events into a waveform."""
+        """Synthesize a list of MIDI events into a waveform.
+
+        Args:
+            event_list: List of MIDI events to synthesize.
+            normalize: If True (default), normalize the waveform to peak amplitude.
+                Set to False to preserve raw amplitude, e.g. when comparing
+                multiple clips at different velocities.
+        """
         current_time = event_list[0].time
 
         # Convert absolute seconds to relative seconds.
@@ -139,8 +147,12 @@ class Synthesizer:
             samples = self._synth.get_samples(end - current_sample)[::2]
             synthesized[current_sample:end] += samples
             current_time += event.time
-        waveform_float = synthesized / np.abs(synthesized).max()
 
-        # Convert to 16-bit ints.
-        normalizer = float(np.iinfo(np.int16).max)
-        return np.array(np.asarray(waveform_float) * normalizer, dtype=np.int16)
+        # FluidSynth returns int16-scale values; convert to [-1, 1] float first.
+        int16_max = float(np.iinfo(np.int16).max)
+        waveform_float = synthesized / int16_max
+
+        if normalize:
+            waveform_float /= np.abs(waveform_float).max()
+
+        return np.array(waveform_float * int16_max, dtype=np.int16)
