@@ -22,6 +22,10 @@ from dm_control import mjcf
 from robopianist.models.piano import piano_constants
 from robopianist.music import midi_file, midi_message
 
+# Maximum key joint velocity (rad/s) that maps to MIDI velocity 127.
+# Based on white key max angle (~0.067 rad) pressed in ~30ms.
+_MAX_KEY_VEL = 5.0
+
 
 class MidiModule:
     """The piano sound module.
@@ -49,6 +53,7 @@ class MidiModule:
         physics: mjcf.Physics,
         activation: np.ndarray,
         sustain_activation: np.ndarray,
+        key_velocities: Optional[np.ndarray] = None,
     ) -> None:
         # Sanity check dtype since we use bitwise operators.
         assert activation.dtype == bool
@@ -62,11 +67,13 @@ class MidiModule:
 
         # Note on events.
         for key_id in np.flatnonzero(state_change & ~self._prev_activation):
+            if key_velocities is not None:
+                velocity = int(np.clip(key_velocities[key_id] / _MAX_KEY_VEL * 126, 0, 126)) + 1
+            else:
+                velocity = 127
             message = midi_message.NoteOn(
                 note=midi_file.key_number_to_midi_number(key_id),
-                # TODO(kevin): In the future, we will replace this with the actual
-                # key velocity. For now, we hardcode it to the maximum velocity.
-                velocity=127,
+                velocity=velocity,
                 time=physics.data.time,
             )
             timestep_events.append(message)

@@ -158,7 +158,7 @@ class Piano(composer.Entity):
         self._update_key_state(physics)
         self._update_key_color(physics)
         self._midi_module.after_substep(
-            physics, self._activation, self._sustain_activation
+            physics, self._activation, self._sustain_activation, self._key_velocities
         )
 
     # Methods.
@@ -169,6 +169,7 @@ class Piano(composer.Entity):
         self._activation = np.zeros(piano_consts.NUM_KEYS, dtype=bool)
         self._sustain_activation = np.zeros(1, dtype=bool)
         self._normalized_state = np.zeros(piano_consts.NUM_KEYS, dtype=np.float64)
+        self._key_velocities = np.zeros(piano_consts.NUM_KEYS, dtype=np.float64)
 
     def is_key_black(self, key_id: int) -> bool:
         """Returns True if the piano key id corresponds to a black key."""
@@ -189,6 +190,7 @@ class Piano(composer.Entity):
             self._activation[:] = (
                 np.abs(self._state - self._qpos_range[:, 1]) <= _KEY_THRESHOLD
             )
+        self._key_velocities[:] = np.abs(physics.bind(self.joints).qvel)
         self._sustain_activation[:] = self._sustain_state >= _SUSTAIN_THRESHOLD
 
     def _update_key_color(self, physics: mjcf.Physics) -> None:
