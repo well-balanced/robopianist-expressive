@@ -29,8 +29,13 @@ from mujoco_utils import collision_utils, spec_utils
 import robopianist.models.hands.shadow_hand_constants as hand_consts
 from robopianist.models.arenas import stage
 from robopianist.music import midi_file
+from robopianist.music.velocity_calibration import VelocityCalibration
 from robopianist.suite import composite_reward
 from robopianist.suite.tasks import base
+
+# Maximum key joint velocity (rad/s) that maps to MIDI velocity 127.
+# Must match the value in midi_module.py.
+_MAX_KEY_VEL = 5.0
 
 # Distance thresholds for the shaping reward.
 _FINGER_CLOSE_ENOUGH_TO_KEY = 0.01
@@ -62,6 +67,7 @@ class PianoWithShadowHands(base.PianoTask):
         augmentations: Optional[Sequence[base_variation.Variation]] = None,
         energy_penalty_coef: float = _ENERGY_PENALTY_COEF,
         randomize_hand_positions: bool = False,
+        disable_velocity_reward: bool = False,
         **kwargs,
     ) -> None:
         """Task constructor.
@@ -88,6 +94,7 @@ class PianoWithShadowHands(base.PianoTask):
             disable_colorization: If True, disables the colorization of the fingertips
                 and corresponding keys.
             disable_hand_collisions: If True, disables collisions between the two hands.
+            disable_velocity_reward: If True, disables the velocity reward term.
             augmentations: A list of `Variation` objects that will be applied to the
                 MIDI file at the beginning of each episode. If None, no augmentations
                 will be applied.
@@ -111,12 +118,15 @@ class PianoWithShadowHands(base.PianoTask):
             disable_fingering_reward or not self._midi.has_fingering()
         )
         self._disable_forearm_reward = disable_forearm_reward
+        self._disable_velocity_reward = disable_velocity_reward
         self._wrong_press_termination = wrong_press_termination
         self._disable_colorization = disable_colorization
         self._disable_hand_collisions = disable_hand_collisions
         self._augmentations = augmentations
         self._energy_penalty_coef = energy_penalty_coef
         self._randomize_hand_positions = randomize_hand_positions
+
+        self._velocity_calib = VelocityCalibration.load()
 
         if not disable_fingering_reward and not disable_colorization:
             self._colorize_fingertips()
@@ -143,10 +153,17 @@ class PianoWithShadowHands(base.PianoTask):
         if not self._disable_forearm_reward:
             self._reward_fn.add("forearm_reward", self._compute_forearm_reward)
 
+        if not self._disable_velocity_reward:
+            self._reward_fn.add("velocity_reward", self._compute_velocity_reward)
+
     def _reset_quantities_at_episode_init(self) -> None:
         self._t_idx: int = 0
         self._should_terminate: bool = False
         self._discount: float = 1.0
+        # Tracks goal from previous timestep to detect new note onsets.
+        self._prev_goal_current: np.ndarray = np.zeros(
+            self.piano.n_keys + 1, dtype=np.float64
+        )
 
     def _maybe_change_midi(self, random_state: np.random.RandomState) -> None:
         if self._augmentations is not None:
@@ -192,6 +209,7 @@ class PianoWithShadowHands(base.PianoTask):
         self._t_idx += 1
         self._should_terminate = (self._t_idx - 1) == len(self._notes) - 1
 
+        self._prev_goal_current = self._goal_current.copy()
         self._goal_current = self._goal_state[0]
 
         if not self._disable_fingering_reward:
@@ -275,6 +293,49 @@ class PianoWithShadowHands(base.PianoTask):
             power = hand.observables.actuators_power(physics).copy()
             rew -= self._energy_penalty_coef * np.sum(power)
         return rew
+
+    def _compute_velocity_reward(self, physics: mjcf.Physics) -> float:
+        """Reward for matching GT note velocity at the moment of key press.
+
+        Only fires on new note onsets (keys that just transitioned from not-goal
+        to goal this timestep). Uses the VelocityCalibration lookup table so the
+        error is measured in perceptual loudness space rather than raw MIDI
+        velocity numbers.
+
+        Returns a value in [-1, 0] averaged over newly pressed keys, or 0 if no
+        new onsets occurred this timestep.
+        """
+        del physics  # key velocities are cached on self.piano
+
+        # Keys that just became part of the goal (new note onsets).
+        new_onsets = np.flatnonzero(
+            self._goal_current[:-1].astype(bool)
+            & ~self._prev_goal_current[:-1].astype(bool)
+        )
+        if new_onsets.size == 0:
+            return 0.0
+
+        # Build key → GT MIDI velocity map for the current timestep.
+        t = self._t_idx - 1  # _t_idx was already incremented in after_step
+        if t < 0 or t >= len(self._notes):
+            return 0.0
+        gt_vel_map = {note.key: note.velocity for note in self._notes[t]}
+
+        rewards = []
+        for key in new_onsets:
+            gt_vel = gt_vel_map.get(key)
+            if gt_vel is None:
+                continue
+            # Convert joint velocity (rad/s) to MIDI velocity using the same
+            # formula as midi_module.py.
+            robot_midi_vel = (
+                int(np.clip(self.piano._key_velocities[key] / _MAX_KEY_VEL * 126, 0, 126)) + 1
+            )
+            rewards.append(self._velocity_calib.reward(robot_midi_vel, gt_vel))
+
+        if not rewards:
+            return 0.0
+        return float(np.mean(rewards))
 
     def _compute_key_press_reward(self, physics: mjcf.Physics) -> float:
         """Reward for pressing the right keys at the right time."""
