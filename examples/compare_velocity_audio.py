@@ -63,7 +63,6 @@ from robopianist.music.constants import SAMPLING_RATE
 
 _NOTE_CLIP_DURATION = 0.6   # seconds: each note clip for per-note RMS
 _NOTE_CLIP_TAIL = 0.3       # seconds: silence after note-off in clip
-_MAX_KEY_VEL = 5.0          # rad/s → vel 127 (matches midi_module.py)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +145,10 @@ def make_robot_velocities_csv(
     return robot_vels
 
 
+def make_robot_velocities_scale(notes: List[NoteRecord], factor: float) -> List[int]:
+    return [_clamp_velocity(n.velocity * factor) for n in notes]
+
+
 def parse_robot_mode(
     mode_str: str, notes: List[NoteRecord], rng: np.random.Generator
 ) -> List[int]:
@@ -158,10 +161,13 @@ def parse_robot_mode(
         return make_robot_velocities_noise(notes, sigma, rng)
     elif mode_str.startswith("csv:"):
         return make_robot_velocities_csv(notes, Path(mode_str.split(":", 1)[1]))
+    elif mode_str.startswith("scale:"):
+        factor = float(mode_str.split(":", 1)[1])
+        return make_robot_velocities_scale(notes, factor)
     else:
         raise ValueError(
             f"Unknown --robot mode '{mode_str}'. "
-            "Expected: perfect | flat:<V> | noise:<sigma> | csv:<path>"
+            "Expected: perfect | flat:<V> | noise:<sigma> | csv:<path> | scale:<factor>"
         )
 
 
@@ -362,6 +368,15 @@ def main() -> None:
         help="Directory for output WAV files and report (default: ./tmp)",
     )
     parser.add_argument(
+        "--gen-scales",
+        default=None,
+        help=(
+            "Comma-separated velocity scale factors to batch-generate WAVs "
+            "(e.g. '0.3,0.5,0.8,1.0'). Saves vel_0.3x.wav etc. in --outdir. "
+            "Skips the per-note report."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -384,6 +399,28 @@ def main() -> None:
     if args.max_notes is not None:
         notes = notes[: args.max_notes]
     print(f"  {len(notes)} notes loaded")
+
+    # --gen-scales: batch WAV generation, one file per scale factor.
+    if args.gen_scales is not None:
+        factors = [float(f) for f in args.gen_scales.split(",")]
+        synth = synthesizer.Synthesizer(sample_rate=SAMPLING_RATE)
+        gt_audio = synthesize_full(synth, notes, [n.velocity for n in notes])
+        int16_max = float(np.iinfo(np.int16).max)
+        gt_peak = np.abs(gt_audio).max()
+        scale_norm = int16_max / gt_peak if gt_peak > 0 else 1.0
+
+        for factor in factors:
+            vels = make_robot_velocities_scale(notes, factor)
+            audio = synthesize_full(synth, notes, vels)
+            audio = np.array(
+                np.clip(audio.astype(np.float64) * scale_norm, -int16_max, int16_max),
+                dtype=np.int16,
+            )
+            out_path = outdir / f"vel_{factor}x.wav"
+            save_wav(out_path, audio, SAMPLING_RATE)
+            print(f"Saved: {out_path}  (scale={factor}, mean vel={np.mean(vels):.1f})")
+        synth.stop()
+        return
 
     rng = np.random.default_rng(args.seed)
     robot_vels = parse_robot_mode(args.robot, notes, rng)
