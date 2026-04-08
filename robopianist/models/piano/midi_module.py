@@ -24,7 +24,9 @@ from robopianist.music import midi_file, midi_message
 
 # Maximum key joint velocity (rad/s) that maps to MIDI velocity 127.
 # Based on white key max angle (~0.067 rad) pressed in ~30ms.
-_MAX_KEY_VEL = 5.0
+# Single source of truth — import this constant wherever the conversion is needed.
+MAX_KEY_VEL: float = 3.5
+_MAX_KEY_VEL = MAX_KEY_VEL  # backward-compat alias (used in tests)
 
 
 class MidiModule:

@@ -8,3 +8,5 @@ dist/
 pig_single_finger/
 .claude/
 tmp/
+PianoFingeringDataset_v1.2/
+CLAUDE.md

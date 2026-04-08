@@ -21,12 +21,14 @@ TODO(kevin):
 """
 
 from collections import deque
-from typing import Deque, Dict, List, NamedTuple, Sequence
+from typing import Deque, Dict, List, NamedTuple, Sequence, Tuple
 
 import dm_env
 import numpy as np
 from dm_env_wrappers import EnvironmentWrapper
 from sklearn.metrics import precision_recall_fscore_support
+
+from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL
 
 
 class EpisodeMetrics(NamedTuple):
@@ -64,6 +66,23 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
         self._sustain_recalls: Deque[float] = deque(maxlen=deque_size)
         self._sustain_f1s: Deque[float] = deque(maxlen=deque_size)
 
+        # Velocity tracking (per onset).
+        self._episode_robot_vels: List[int] = []
+        self._episode_gt_vels: List[int] = []
+        self._episode_robot_qvels: List[float] = []
+        self._all_robot_vels: Deque[List[int]] = deque(maxlen=deque_size)
+        self._all_gt_vels: Deque[List[int]] = deque(maxlen=deque_size)
+        self._all_robot_qvels: Deque[List[float]] = deque(maxlen=deque_size)
+
+        # Detailed per-onset trace (key_id, t_idx, qvel, midi vels, error, match flag).
+        self._episode_onset_trace: List[dict] = []
+        self._all_onset_traces: Deque[List[dict]] = deque(maxlen=deque_size)
+        # Count of robot onsets that had no matching GT note (wrong key / timing mismatch).
+        self._episode_unmatched_onsets: int = 0
+        self._all_unmatched_onsets: Deque[int] = deque(maxlen=deque_size)
+        self._episode_total_onsets: int = 0
+        self._all_total_onsets: Deque[int] = deque(maxlen=deque_size)
+
     def step(self, action: np.ndarray) -> dm_env.TimeStep:
         timestep = self._environment.step(action)
 
@@ -71,6 +90,48 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
         self._key_presses.append(key_activation.astype(np.float64))
         sustain_activation = self._environment.task.piano.sustain_activation
         self._sustain_presses.append(sustain_activation.astype(np.float64))
+
+        # Velocity tracking: record robot and GT MIDI velocity at each new onset.
+        task = self._environment.task
+        new_onsets = np.flatnonzero(key_activation & ~task._prev_activation)
+        if new_onsets.size > 0:
+            t = task._t_idx - 1
+            if 0 <= t < len(task._notes):
+                gt_vel_map = {note.key: note.velocity for note in task._notes[t]}
+                self._episode_total_onsets += len(new_onsets)
+                for key in new_onsets:
+                    gt_vel = gt_vel_map.get(int(key))
+                    qvel = float(task.piano._onset_velocities[key])
+                    robot_midi_vel = int(np.clip(qvel / _MAX_KEY_VEL * 126, 0, 126)) + 1
+                    if gt_vel is None:
+                        self._episode_unmatched_onsets += 1
+                        self._episode_onset_trace.append({
+                            "t_idx": t,
+                            "key_id": int(key),
+                            "robot_qvel": round(qvel, 4),
+                            "robot_midi_vel": robot_midi_vel,
+                            "gt_midi_vel": -1,
+                            "needed_qvel": None,
+                            "qvel_gap": None,
+                            "error": None,
+                            "matched": False,
+                        })
+                        continue
+                    needed_qvel = float(gt_vel) / 127.0 * _MAX_KEY_VEL
+                    self._episode_robot_vels.append(robot_midi_vel)
+                    self._episode_gt_vels.append(int(gt_vel))
+                    self._episode_robot_qvels.append(qvel)
+                    self._episode_onset_trace.append({
+                        "t_idx": t,
+                        "key_id": int(key),
+                        "robot_qvel": round(qvel, 4),
+                        "robot_midi_vel": robot_midi_vel,
+                        "gt_midi_vel": int(gt_vel),
+                        "needed_qvel": round(needed_qvel, 4),
+                        "qvel_gap": round(qvel - needed_qvel, 4),
+                        "error": robot_midi_vel - int(gt_vel),
+                        "matched": True,
+                    })
 
         if timestep.last():
             key_press_metrics = self._compute_key_press_metrics()
@@ -83,14 +144,72 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
             self._sustain_recalls.append(sustain_metrics.recall)
             self._sustain_f1s.append(sustain_metrics.f1)
 
+            self._all_robot_vels.append(list(self._episode_robot_vels))
+            self._all_gt_vels.append(list(self._episode_gt_vels))
+            self._all_robot_qvels.append(list(self._episode_robot_qvels))
+            self._all_onset_traces.append(list(self._episode_onset_trace))
+            self._all_unmatched_onsets.append(self._episode_unmatched_onsets)
+            self._all_total_onsets.append(self._episode_total_onsets)
+
             self._key_presses = []
             self._sustain_presses = []
+            self._episode_robot_vels = []
+            self._episode_gt_vels = []
+            self._episode_robot_qvels = []
+            self._episode_onset_trace = []
+            self._episode_unmatched_onsets = 0
+            self._episode_total_onsets = 0
         return timestep
 
     def reset(self) -> dm_env.TimeStep:
         self._key_presses = []
         self._sustain_presses = []
+        self._episode_robot_vels = []
+        self._episode_gt_vels = []
+        self._episode_robot_qvels = []
+        self._episode_onset_trace = []
+        self._episode_unmatched_onsets = 0
+        self._episode_total_onsets = 0
         return self._environment.reset()
+
+    def get_velocity_metrics(self) -> Dict[str, float]:
+        """Returns velocity statistics over the last `deque_size` episodes."""
+        robot_vels = [v for ep in self._all_robot_vels for v in ep]
+        gt_vels = [v for ep in self._all_gt_vels for v in ep]
+        if not robot_vels:
+            return {}
+        robot_arr = np.array(robot_vels)
+        gt_arr = np.array(gt_vels)
+        robot_qvels = [v for ep in self._all_robot_qvels for v in ep]
+        robot_qvel_arr = np.array(robot_qvels) if robot_qvels else np.array([0.0])
+        errors = robot_arr - gt_arr
+        total = sum(self._all_total_onsets) if self._all_total_onsets else 0
+        return {
+            "mean_robot_midi_vel": float(np.mean(robot_arr)),
+            "std_robot_midi_vel": float(np.std(robot_arr)),
+            "mean_gt_midi_vel": float(np.mean(gt_arr)),
+            "velocity_mae": float(np.mean(np.abs(errors))),
+            "velocity_bias": float(np.mean(errors)),  # positive = over-shooting GT
+            "max_robot_onset_qvel": float(np.max(robot_qvel_arr)),
+            "p90_robot_onset_qvel": float(np.percentile(robot_qvel_arr, 90)),
+            "mean_robot_onset_qvel": float(np.mean(robot_qvel_arr)),
+            "onset_match_rate": float(robot_arr.size / total) if total > 0 else 0.0,
+        }
+
+    def get_velocity_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Returns (robot_midi_vels, gt_midi_vels) arrays for histogram plotting."""
+        robot_vels = [v for ep in self._all_robot_vels for v in ep]
+        gt_vels = [v for ep in self._all_gt_vels for v in ep]
+        return np.array(robot_vels, dtype=np.int32), np.array(gt_vels, dtype=np.int32)
+
+    def get_episode_velocity_trace(self) -> List[dict]:
+        """Returns per-onset detail rows for the last episode(s).
+
+        Each row has: t_idx, key_id, robot_qvel, robot_midi_vel, gt_midi_vel,
+        error (robot - gt, None if unmatched), matched (bool).
+        Suitable for logging as a wandb.Table.
+        """
+        return [row for ep in self._all_onset_traces for row in ep]
 
     def get_musical_metrics(self) -> Dict[str, float]:
         """Returns the mean precision/recall/F1 over the last `deque_size` episodes."""
