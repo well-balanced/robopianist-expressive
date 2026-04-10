@@ -187,8 +187,8 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
         return {
             "mean_robot_midi_vel": float(np.mean(robot_arr)),
             "std_robot_midi_vel": float(np.std(robot_arr)),
-            "mean_gt_midi_vel": float(np.mean(gt_arr)),
             "velocity_mae": float(np.mean(np.abs(errors))),
+            "velocity_mse": float(np.mean(errors**2)),
             "velocity_bias": float(np.mean(errors)),  # positive = over-shooting GT
             "max_robot_onset_qvel": float(np.max(robot_qvel_arr)),
             "p90_robot_onset_qvel": float(np.percentile(robot_qvel_arr, 90)),
