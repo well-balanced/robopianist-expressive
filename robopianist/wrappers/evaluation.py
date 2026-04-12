@@ -83,6 +83,12 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
         self._episode_total_onsets: int = 0
         self._all_total_onsets: Deque[int] = deque(maxlen=deque_size)
 
+        # Per-component reward accumulation (step-level means and sums per episode).
+        self._episode_reward_sums: Dict[str, float] = {}
+        self._episode_reward_steps: int = 0
+        self._all_reward_component_means: Deque[Dict[str, float]] = deque(maxlen=deque_size)
+        self._all_reward_component_sums: Deque[Dict[str, float]] = deque(maxlen=deque_size)
+
     def step(self, action: np.ndarray) -> dm_env.TimeStep:
         timestep = self._environment.step(action)
 
@@ -133,6 +139,12 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
                         "matched": True,
                     })
 
+        # Accumulate per-component reward values for this step.
+        reward_terms = self._environment.task.reward_fn.reward_terms
+        for name, val in reward_terms.items():
+            self._episode_reward_sums[name] = self._episode_reward_sums.get(name, 0.0) + float(val)
+        self._episode_reward_steps += 1
+
         if timestep.last():
             key_press_metrics = self._compute_key_press_metrics()
             self._key_press_precisions.append(key_press_metrics.precision)
@@ -150,6 +162,13 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
             self._all_onset_traces.append(list(self._episode_onset_trace))
             self._all_unmatched_onsets.append(self._episode_unmatched_onsets)
             self._all_total_onsets.append(self._episode_total_onsets)
+
+            if self._episode_reward_steps > 0:
+                means = {k: v / self._episode_reward_steps for k, v in self._episode_reward_sums.items()}
+                self._all_reward_component_means.append(means)
+                self._all_reward_component_sums.append(dict(self._episode_reward_sums))
+            self._episode_reward_sums = {}
+            self._episode_reward_steps = 0
 
             self._key_presses = []
             self._sustain_presses = []
@@ -170,7 +189,20 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
         self._episode_onset_trace = []
         self._episode_unmatched_onsets = 0
         self._episode_total_onsets = 0
+        self._episode_reward_sums = {}
+        self._episode_reward_steps = 0
         return self._environment.reset()
+
+    def get_reward_component_stats(self) -> Dict[str, float]:
+        """Returns per-component reward mean and episode sum over the last `deque_size` episodes."""
+        if not self._all_reward_component_means or not self._all_reward_component_sums:
+            return {}
+        all_keys = set(k for ep in self._all_reward_component_means for k in ep)
+        result = {}
+        for key in all_keys:
+            means = [ep[key] for ep in self._all_reward_component_means if key in ep]
+            result[f"reward_{key}_mean"] = float(np.mean(means))
+        return result
 
     def get_velocity_metrics(self) -> Dict[str, float]:
         """Returns velocity statistics over the last `deque_size` episodes."""
@@ -192,7 +224,6 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
             "velocity_bias": float(np.mean(errors)),  # positive = over-shooting GT
             "max_robot_onset_qvel": float(np.max(robot_qvel_arr)),
             "p90_robot_onset_qvel": float(np.percentile(robot_qvel_arr, 90)),
-            "mean_robot_onset_qvel": float(np.mean(robot_qvel_arr)),
             "onset_match_rate": float(robot_arr.size / total) if total > 0 else 0.0,
         }
 
