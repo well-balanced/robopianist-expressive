@@ -69,8 +69,8 @@ class PianoWithShadowHands(base.PianoTask):
         augmentations: Optional[Sequence[base_variation.Variation]] = None,
         energy_penalty_coef: float = _ENERGY_PENALTY_COEF,
         key_press_reward_coef: float = _KEY_PRESS_REWARD_COEF,
-        velocity_reward_coef: float = _VELOCITY_REWARD_COEF,
         randomize_hand_positions: bool = False,
+        velocity_reward_coef: float = _VELOCITY_REWARD_COEF,
         disable_velocity_reward: bool = False,
         use_key_press_v2: bool = False,
         n_steps_velocity_lookahead: int = 3,
@@ -130,6 +130,7 @@ class PianoWithShadowHands(base.PianoTask):
             disable_fingering_reward or not self._midi.has_fingering()
         )
         self._disable_forearm_reward = disable_forearm_reward
+        self._velocity_reward_coef = velocity_reward_coef
         self._disable_velocity_reward = disable_velocity_reward
         self._n_steps_velocity_lookahead = n_steps_velocity_lookahead
         self._wrong_press_termination = wrong_press_termination
@@ -138,7 +139,6 @@ class PianoWithShadowHands(base.PianoTask):
         self._augmentations = augmentations
         self._energy_penalty_coef = energy_penalty_coef
         self._key_press_reward_coef = key_press_reward_coef
-        self._velocity_reward_coef = velocity_reward_coef
         self._use_key_press_v2 = use_key_press_v2
         self._randomize_hand_positions = randomize_hand_positions
 
@@ -171,10 +171,6 @@ class PianoWithShadowHands(base.PianoTask):
 
         if not self._disable_forearm_reward:
             self._reward_fn.add("forearm_reward", self._compute_forearm_reward)
-
-        # v2 integrates velocity into key_press; separate velocity_reward not needed.
-        if not self._disable_velocity_reward and not self._use_key_press_v2:
-            self._reward_fn.add("velocity_reward", self._compute_velocity_reward)
 
     def _reset_quantities_at_episode_init(self) -> None:
         self._t_idx: int = 0
@@ -325,41 +321,6 @@ class PianoWithShadowHands(base.PianoTask):
             rew -= self._energy_penalty_coef * np.sum(power)
         return rew
 
-    def _compute_velocity_reward(self, physics: mjcf.Physics) -> float:
-        """Reward for matching the target MIDI velocity at each new key onset.
-
-        Fires only at onset timesteps (keys just pressed this step).
-        Uses tolerance() with gaussian sigmoid: full reward within GT±5,
-        decays to 0.1 at ±45. Returns coef when no onsets this step.
-        """
-        del physics  # Unused.
-        activation = self.piano.activation
-        new_onsets = activation & ~self._prev_activation
-
-        if not new_onsets.any():
-            return self._velocity_reward_coef
-
-        t = self._t_idx - 1
-        gt_velocity_map = {note.key: note.velocity for note in self._notes[t]}
-
-        rewards = []
-        for key in np.flatnonzero(new_onsets):
-            gt_vel = gt_velocity_map.get(int(key))
-            if gt_vel is None:
-                rewards.append(1.0)
-                continue
-            robot_midi_vel = (
-                int(np.clip(self.piano._onset_velocities[key] / _MAX_KEY_VEL * 126, 0, 126)) + 1
-            )
-            rewards.append(float(tolerance(
-                robot_midi_vel,
-                bounds=(max(1, int(gt_vel) - 3), min(127, int(gt_vel) + 3)),
-                margin=30,
-                sigmoid="gaussian",
-                value_at_margin=0.1,
-            )))
-
-        return self._velocity_reward_coef * float(np.mean(rewards))
 
     def _compute_key_press_reward(self, physics: mjcf.Physics) -> float:
         """Reward for pressing the right keys at the right time."""
@@ -430,7 +391,10 @@ class PianoWithShadowHands(base.PianoTask):
                     sigmoid="gaussian",
                     value_at_margin=0.1,
                 ))
-            rew += 0.5 * float(np.mean(pos_scores * vel_factors))
+            # Blend vel_factors with velocity_reward_coef (set by LagrangianVelocityWrapper).
+            # coef=1.0 → full velocity penalty; coef=0.0 → no velocity penalty (pos only).
+            blended = 1.0 - self._velocity_reward_coef * (1.0 - vel_factors)
+            rew += 0.5 * float(np.mean(pos_scores * blended))
 
         off = np.flatnonzero(1 - self._goal_current[:-1])
         rew += 0.5 * (1 - float(self.piano.activation[off].any()))
