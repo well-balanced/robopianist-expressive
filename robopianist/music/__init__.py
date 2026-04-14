@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Union
 
 from robopianist import _PROJECT_ROOT
-from robopianist.music import library, midi_file
+from robopianist.music import library, midi_file, style_transform
 
 
 def _camel_case(name: str) -> str:
@@ -98,4 +98,5 @@ __all__ = [
     "PIG_MIDIS",
     "ETUDE_MIDIS",
     "load",
+    "style_transform",
 ]

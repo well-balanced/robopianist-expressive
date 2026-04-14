@@ -21,6 +21,7 @@ from dm_control import composer
 from mujoco_utils import composer_utils
 
 from robopianist import music
+from robopianist.music.style_transform import apply_style
 from robopianist.suite.tasks import piano_with_shadow_hands
 
 # RoboPianist-repertoire-150.
@@ -56,6 +57,10 @@ def load(
     recompile_physics: bool = False,
     legacy_step: bool = True,
     task_kwargs: Optional[Mapping[str, Any]] = None,
+    style_velocity_scale: float = 1.0,
+    style_velocity_contrast: float = 1.0,
+    style_melody_gain: float = 1.0,
+    style_dynamic_trend: float = 0.0,
 ) -> composer.Environment:
     """Loads a RoboPianist environment.
 
@@ -83,6 +88,21 @@ def load(
         midi = music.load(_ALL_DICT[environment_name], stretch=stretch, shift=shift)
 
     task_kwargs = task_kwargs or {}
+
+    # Apply velocity style transforms if any are non-default.
+    if (
+        style_velocity_scale != 1.0
+        or style_velocity_contrast != 1.0
+        or style_melody_gain != 1.0
+        or style_dynamic_trend != 0.0
+    ):
+        midi = apply_style(
+            midi,
+            velocity_scale=style_velocity_scale,
+            velocity_contrast=style_velocity_contrast,
+            melody_gain=style_melody_gain,
+            dynamic_trend=style_dynamic_trend,
+        )
 
     return composer_utils.Environment(
         task=piano_with_shadow_hands.PianoWithShadowHands(midi=midi, **task_kwargs),
