@@ -28,7 +28,7 @@ from mujoco_utils import collision_utils, spec_utils
 
 import robopianist.models.hands.shadow_hand_constants as hand_consts
 from robopianist.models.arenas import stage
-from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL
+from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL, QVEL_MIN as _QVEL_MIN
 from robopianist.music import midi_file
 from robopianist.suite import composite_reward
 from robopianist.suite.tasks import base
@@ -74,6 +74,7 @@ class PianoWithShadowHands(base.PianoTask):
         disable_velocity_reward: bool = False,
         use_key_press_v2: bool = False,
         n_steps_velocity_lookahead: int = 3,
+        velocity_obs_mode: Optional[str] = None,
         **kwargs,
     ) -> None:
         """Task constructor.
@@ -113,6 +114,14 @@ class PianoWithShadowHands(base.PianoTask):
                 hands at the beginning of each episode.
             n_steps_velocity_lookahead: Number of timesteps to look ahead in the
                 velocity goal observable. Independent of n_steps_lookahead.
+            velocity_obs_mode: Controls what velocity information is added to
+                observations. One of:
+                - None: no velocity observation (default).
+                - "current": GT velocity for the current step only (88 dims).
+                - "lookahead": GT velocity for current + n_steps_velocity_lookahead
+                  future steps, flattened ((n_steps_velocity_lookahead+1)*88 dims).
+                - "scaled_goal": goal state with binary 1.0 replaced by
+                  velocity/127.0; same shape as the regular goal observable.
         """
         super().__init__(arena=stage.Stage(), **kwargs)
 
@@ -133,6 +142,7 @@ class PianoWithShadowHands(base.PianoTask):
         self._velocity_reward_coef = velocity_reward_coef
         self._disable_velocity_reward = disable_velocity_reward
         self._n_steps_velocity_lookahead = n_steps_velocity_lookahead
+        self._velocity_obs_mode = velocity_obs_mode
         self._wrong_press_termination = wrong_press_termination
         self._disable_colorization = disable_colorization
         self._disable_hand_collisions = disable_hand_collisions
@@ -382,12 +392,15 @@ class PianoWithShadowHands(base.PianoTask):
                 if gt_vel == -1:
                     continue
                 robot_midi_vel = (
-                    int(np.clip(self.piano._onset_velocities[key] / _MAX_KEY_VEL * 126, 0, 126)) + 1
+                    int(np.clip(
+                        (self.piano._onset_velocities[key] - _QVEL_MIN) / (_MAX_KEY_VEL - _QVEL_MIN) * 126,
+                        0, 126
+                    )) + 1
                 )
                 vel_factors[i] = float(tolerance(
                     robot_midi_vel,
                     bounds=(max(1, int(gt_vel) - 3), min(127, int(gt_vel) + 3)),
-                    margin=30,
+                    margin=10,
                     sigmoid="gaussian",
                     value_at_margin=0.1,
                 ))
@@ -504,6 +517,26 @@ class PianoWithShadowHands(base.PianoTask):
             for note in self._notes[t]:
                 self._velocity_goal_state[i, note.key] = note.velocity / 127.0
 
+    def _get_velocity_scaled_goal_state(self) -> np.ndarray:
+        """Goal state with velocity scaling instead of binary 1.0.
+
+        Same shape as the regular goal state: (n_steps_lookahead+1, n_keys+1).
+        Where the regular goal has 1.0 for a pressed key, this has velocity/127.
+        The sustain dimension (last) stays binary, as sustain has no velocity.
+        Returns zeros if the episode is ending.
+        """
+        n = self._n_steps_lookahead + 1
+        result = np.zeros((n, self.piano.n_keys + 1), dtype=np.float64)
+        if self._t_idx == len(self._notes):
+            return result
+        t_start = self._t_idx
+        t_end = min(t_start + n, len(self._notes))
+        for i, t in enumerate(range(t_start, t_end)):
+            for note in self._notes[t]:
+                result[i, note.key] = note.velocity / 127.0
+            result[i, -1] = self._sustains[t]
+        return result
+
     def _update_fingering_state(self) -> None:
         if self._t_idx == len(self._notes):
             return
@@ -545,9 +578,14 @@ class PianoWithShadowHands(base.PianoTask):
         self.piano.observables.sustain_state.enabled = True
 
         # This returns the goal state for the current timestep and n steps ahead.
+        # In "scaled_goal" mode the binary 1.0 entries are replaced by velocity/127
+        # so the agent sees target intensity directly; _goal_state stays binary for
+        # reward computation.
         def _get_goal_state(physics) -> np.ndarray:
             del physics  # Unused.
             self._update_goal_state()
+            if self._velocity_obs_mode == "scaled_goal":
+                return self._get_velocity_scaled_goal_state().ravel()
             return self._goal_state.ravel()
 
         goal_observable = observable.Generic(_get_goal_state)
@@ -564,18 +602,32 @@ class PianoWithShadowHands(base.PianoTask):
         fingering_observable.enabled = not self._disable_fingering_reward
         self._task_observables["fingering"] = fingering_observable
 
-        # Target velocity for the current timestep and n_steps_velocity_lookahead ahead.
-        # Shape: (n_steps_velocity_lookahead+1, n_keys), flattened. Values in [0, 1].
-        # Does not affect goal_state or any reward computation.
-        # TODO: f1 score was dropping when this was enabled. improve this later.
-        # def _get_velocity_goal_state(physics) -> np.ndarray:
-        #     del physics  # Unused.
-        #     self._update_velocity_goal_state()
-        #     return self._velocity_goal_state.ravel()
+        # Velocity observation — controlled by velocity_obs_mode.
+        # "current":     GT velocity for current step only, shape (88,).
+        # "lookahead":   GT velocity for current + future steps,
+        #                shape ((n_steps_velocity_lookahead+1)*88,).
+        # "scaled_goal": goal state where 1.0 → velocity/127, same shape as goal.
+        if self._velocity_obs_mode == "current":
+            def _get_velocity_obs(physics) -> np.ndarray:
+                del physics
+                self._update_velocity_goal_state()
+                return self._velocity_goal_state[0]  # (88,)
 
-        # velocity_goal_observable = observable.Generic(_get_velocity_goal_state)
-        # velocity_goal_observable.enabled = True
-        # self._task_observables["velocity_goal"] = velocity_goal_observable
+            vel_obs = observable.Generic(_get_velocity_obs)
+            vel_obs.enabled = True
+            self._task_observables["velocity_obs"] = vel_obs
+
+        elif self._velocity_obs_mode == "lookahead":
+            def _get_velocity_obs(physics) -> np.ndarray:
+                del physics
+                self._update_velocity_goal_state()
+                return self._velocity_goal_state.ravel()  # ((n+1)*88,)
+
+            vel_obs = observable.Generic(_get_velocity_obs)
+            vel_obs.enabled = True
+            self._task_observables["velocity_obs"] = vel_obs
+
+        # "scaled_goal" is handled above by overriding the goal observable itself.
 
     def _colorize_fingertips(self) -> None:
         """Colorize the fingertips of the hands."""

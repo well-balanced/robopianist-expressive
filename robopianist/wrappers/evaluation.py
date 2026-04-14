@@ -28,7 +28,7 @@ import numpy as np
 from dm_env_wrappers import EnvironmentWrapper
 from sklearn.metrics import precision_recall_fscore_support
 
-from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL
+from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL, QVEL_MIN as _QVEL_MIN
 
 
 class EpisodeMetrics(NamedTuple):
@@ -108,7 +108,9 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
                 for key in new_onsets:
                     gt_vel = gt_vel_map.get(int(key))
                     qvel = float(task.piano._onset_velocities[key])
-                    robot_midi_vel = int(np.clip(qvel / _MAX_KEY_VEL * 126, 0, 126)) + 1
+                    robot_midi_vel = int(np.clip(
+                        (qvel - _QVEL_MIN) / (_MAX_KEY_VEL - _QVEL_MIN) * 126, 0, 126
+                    )) + 1
                     if gt_vel is None:
                         self._episode_unmatched_onsets += 1
                         self._episode_onset_trace.append({
@@ -123,7 +125,7 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
                             "matched": False,
                         })
                         continue
-                    needed_qvel = float(gt_vel) / 127.0 * _MAX_KEY_VEL
+                    needed_qvel = (float(gt_vel) - 1) / 126.0 * (_MAX_KEY_VEL - _QVEL_MIN) + _QVEL_MIN
                     self._episode_robot_vels.append(robot_midi_vel)
                     self._episode_gt_vels.append(int(gt_vel))
                     self._episode_robot_qvels.append(qvel)
