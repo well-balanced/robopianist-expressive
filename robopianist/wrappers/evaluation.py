@@ -29,6 +29,7 @@ from dm_env_wrappers import EnvironmentWrapper
 from sklearn.metrics import precision_recall_fscore_support
 
 from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL, QVEL_MIN as _QVEL_MIN
+from robopianist.music.velocity_calibration import VelocityCalibration
 
 
 def _fallback_score_key_metadata(task, t_idx: int, key_id: int) -> Dict[str, Optional[int | bool]]:
@@ -90,6 +91,7 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
     def __init__(self, environment: dm_env.Environment, deque_size: int = 1) -> None:
         super().__init__(environment)
 
+        self._velocity_calib = VelocityCalibration.load()
         self._key_presses: List[np.ndarray] = []
         self._sustain_presses: List[np.ndarray] = []
 
@@ -220,6 +222,13 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
         gt_arr = np.array([row["gt_midi_vel"] for row in matched_rows])
         robot_qvel_arr = np.array([row["robot_qvel"] for row in matched_rows], dtype=np.float64)
         errors = robot_arr - gt_arr
+
+        calib = self._velocity_calib
+        robot_loud = np.array([calib.loudness_db(int(v)) for v in robot_arr])
+        gt_loud = np.array([calib.loudness_db(int(v)) for v in gt_arr])
+        loud_errors = robot_loud - gt_loud
+        loud_corr = float(np.corrcoef(robot_loud, gt_loud)[0, 1]) if len(robot_loud) > 1 else float("nan")
+
         return {
             "mean_robot_midi_vel": float(np.mean(robot_arr)),
             "std_robot_midi_vel": float(np.std(robot_arr)),
@@ -228,6 +237,9 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
             "velocity_bias": float(np.mean(errors)),  # positive = over-shooting GT
             "max_robot_onset_qvel": float(np.max(robot_qvel_arr)),
             "p90_robot_onset_qvel": float(np.percentile(robot_qvel_arr, 90)),
+            "loudness_mae": float(np.mean(np.abs(loud_errors))),
+            "loudness_bias": float(np.mean(loud_errors)),
+            "loudness_correlation": loud_corr,
         }
 
     def get_velocity_arrays(self) -> Tuple[np.ndarray, np.ndarray]:

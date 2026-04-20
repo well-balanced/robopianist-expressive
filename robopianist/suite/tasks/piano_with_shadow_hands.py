@@ -30,6 +30,7 @@ import robopianist.models.hands.shadow_hand_constants as hand_consts
 from robopianist.models.arenas import stage
 from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL, QVEL_MIN as _QVEL_MIN
 from robopianist.music import midi_file
+from robopianist.music.velocity_calibration import VelocityCalibration
 from robopianist.suite import composite_reward
 from robopianist.suite.tasks import base
 
@@ -174,6 +175,7 @@ class PianoWithShadowHands(base.PianoTask):
         self._use_key_press_v2 = use_key_press_v2
         self._velocity_onset_window_steps = velocity_onset_window_steps
         self._randomize_hand_positions = randomize_hand_positions
+        self._velocity_calib = VelocityCalibration.load()
         self._score_active_velocity_maps: List[Dict[int, int]] = []
         self._score_true_onset_velocity_maps: List[Dict[int, int]] = []
 
@@ -519,7 +521,8 @@ class PianoWithShadowHands(base.PianoTask):
     def _compute_velocity_reward(self, physics: mjcf.Physics) -> float:
         """Separate velocity reward that fires at new onsets (naive reward shaping).
 
-        Returns coef * mean(tolerance(robot_vel, GT±5)) over onset keys.
+        Returns coef * mean(1 + calib.reward(robot_vel, gt_vel)) over onset keys,
+        where calib.reward returns -(Δloudness)² in [-1,0] (perceptual loudness space).
         Returns coef on non-onset steps (no gradient, no penalty).
         Used when use_key_press_v2=False and disable_velocity_reward=False.
         """
@@ -542,13 +545,7 @@ class PianoWithShadowHands(base.PianoTask):
                     0, 126,
                 )) + 1
             )
-            rewards.append(float(tolerance(
-                robot_midi_vel,
-                bounds=(max(1, gt_vel - 5), min(127, gt_vel + 5)),
-                margin=40,
-                sigmoid="gaussian",
-                value_at_margin=0.1,
-            )))
+            rewards.append(1.0 + self._velocity_calib.reward(robot_midi_vel, gt_vel))
         return self._velocity_reward_coef * float(np.mean(rewards))
 
     def _compute_key_press_reward_v2(self, physics: mjcf.Physics) -> float:
@@ -614,13 +611,7 @@ class PianoWithShadowHands(base.PianoTask):
                             0, 126
                         )) + 1
                     )
-                    vel_factor = float(tolerance(
-                        robot_midi_vel,
-                        bounds=(max(1, int(gt_vel) - 3), min(127, int(gt_vel) + 3)),
-                        margin=10,
-                        sigmoid="gaussian",
-                        value_at_margin=0.1,
-                    ))
+                    vel_factor = 1.0 + self._velocity_calib.reward(robot_midi_vel, int(gt_vel))
                     onset_factor = timing_weight * vel_factor
                     blended = 1.0 - self._velocity_reward_coef * (1.0 - onset_factor)
                     blended_scores[i] *= blended
