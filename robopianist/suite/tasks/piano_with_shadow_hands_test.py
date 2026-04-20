@@ -23,6 +23,7 @@ from dm_control import composer
 from mujoco_utils import spec_utils
 from note_seq.protobuf import music_pb2
 
+from robopianist.models.piano.midi_module import QVEL_MIN as _QVEL_MIN
 from robopianist.music import midi_file
 from robopianist.suite.tasks import piano_with_shadow_hands
 
@@ -52,21 +53,100 @@ def _get_test_midi(dt: float = 0.01) -> midi_file.MidiFile:
     return midi_file.MidiFile(seq=seq)
 
 
+def _get_test_midi_with_sustain(dt: float = 0.01) -> midi_file.MidiFile:
+    seq = music_pb2.NoteSequence()
+
+    seq.notes.add(
+        start_time=0.0,
+        end_time=1 * dt,
+        velocity=80,
+        pitch=midi_file.note_name_to_midi_number("C6"),
+        part=1,
+    )
+    seq.control_changes.add(
+        time=0.0,
+        control_number=64,
+        control_value=64,
+        instrument=0,
+    )
+    seq.control_changes.add(
+        time=3 * dt,
+        control_number=64,
+        control_value=0,
+        instrument=0,
+    )
+
+    seq.total_time = 4 * dt
+    seq.tempos.add(qpm=60)
+    return midi_file.MidiFile(seq=seq)
+
+
+def _get_test_midi_repeated_same_key(dt: float = 0.01) -> midi_file.MidiFile:
+    seq = music_pb2.NoteSequence()
+
+    # C6 onset at t=0 for 1 dt.
+    seq.notes.add(
+        start_time=0.0,
+        end_time=1 * dt,
+        velocity=80,
+        pitch=midi_file.note_name_to_midi_number("C6"),
+        part=1,
+    )
+    # Same key again at t=4 for 1 dt.
+    seq.notes.add(
+        start_time=4 * dt,
+        end_time=5 * dt,
+        velocity=72,
+        pitch=midi_file.note_name_to_midi_number("C6"),
+        part=1,
+    )
+
+    seq.total_time = 5 * dt
+    seq.tempos.add(qpm=60)
+    return midi_file.MidiFile(seq=seq)
+
+
+def _get_test_midi_intervening_other_key(dt: float = 0.01) -> midi_file.MidiFile:
+    seq = music_pb2.NoteSequence()
+
+    seq.notes.add(
+        start_time=0.0,
+        end_time=1 * dt,
+        velocity=80,
+        pitch=midi_file.note_name_to_midi_number("C6"),
+        part=1,
+    )
+    seq.notes.add(
+        start_time=2 * dt,
+        end_time=3 * dt,
+        velocity=76,
+        pitch=midi_file.note_name_to_midi_number("D6"),
+        part=2,
+    )
+
+    seq.total_time = 3 * dt
+    seq.tempos.add(qpm=60)
+    return midi_file.MidiFile(seq=seq)
+
+
 def _get_env(
     control_timestep: float = 0.01,
     n_steps_lookahead: int = 0,
     n_seconds_lookahead: Optional[float] = None,
     wrong_press_termination: bool = False,
     disable_fingering_reward: bool = False,
+    midi: Optional[midi_file.MidiFile] = None,
+    velocity_onset_window_steps: int = 0,
 ) -> composer.Environment:
     task = piano_with_shadow_hands.PianoWithShadowHands(
-        midi=_get_test_midi(dt=control_timestep),
+        midi=midi or _get_test_midi(dt=control_timestep),
         n_steps_lookahead=n_steps_lookahead,
         n_seconds_lookahead=n_seconds_lookahead,
         control_timestep=control_timestep,
         wrong_press_termination=wrong_press_termination,
         change_color_on_activation=True,
         disable_fingering_reward=disable_fingering_reward,
+        velocity_onset_window_steps=velocity_onset_window_steps,
     )
     return composer.Environment(task, strip_singleton_obs_buffer_dim=True)
 
@@ -224,6 +304,159 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
             np.testing.assert_array_equal(rh_idxs, actual_rh_current)
             actual_lh_current = [r[1] for r in env.task._lh_keys_current]
             np.testing.assert_array_equal(lh_idxs, actual_lh_current)
+
+    def test_score_key_metadata_distinguishes_true_onset_from_active_note(self) -> None:
+        env = _get_env(control_timestep=0.01)
+        key_id = midi_file.note_name_to_key_number("C6")
+
+        onset_metadata = env.task.get_score_key_metadata(0, key_id)
+        self.assertTrue(onset_metadata.score_key_active)
+        self.assertTrue(onset_metadata.gt_is_true_onset)
+        self.assertFalse(onset_metadata.score_sustain)
+        self.assertEqual(onset_metadata.gt_active_midi_vel, 80)
+        self.assertEqual(onset_metadata.gt_true_onset_midi_vel, 80)
+
+        held_metadata = env.task.get_score_key_metadata(1, key_id)
+        self.assertTrue(held_metadata.score_key_active)
+        self.assertFalse(held_metadata.gt_is_true_onset)
+        self.assertFalse(held_metadata.score_sustain)
+        self.assertEqual(held_metadata.gt_active_midi_vel, 80)
+        self.assertIsNone(held_metadata.gt_true_onset_midi_vel)
+
+    def test_score_key_metadata_reports_score_sustain(self) -> None:
+        env = _get_env(
+            control_timestep=0.01,
+            disable_fingering_reward=True,
+            midi=_get_test_midi_with_sustain(dt=0.01),
+        )
+        key_id = midi_file.note_name_to_key_number("C6")
+
+        metadata = env.task.get_score_key_metadata(1, key_id)
+        self.assertTrue(metadata.score_sustain)
+
+    def test_match_score_onset_uses_symmetric_timestep_window(self) -> None:
+        window = 2
+        env = _get_env(control_timestep=0.01, velocity_onset_window_steps=window)
+        key_id = midi_file.note_name_to_key_number("C6")
+
+        exact_match = env.task.match_score_onset(0, key_id)
+        self.assertEqual(exact_match.matched_t_idx, 0)
+        self.assertEqual(exact_match.gt_true_onset_midi_vel, 80)
+        self.assertEqual(exact_match.timing_offset, 0)
+        self.assertAlmostEqual(exact_match.timing_weight, 1.0)
+
+        delayed_match = env.task.match_score_onset(1, key_id)
+        self.assertEqual(delayed_match.matched_t_idx, 0)
+        self.assertEqual(delayed_match.gt_true_onset_midi_vel, 80)
+        self.assertEqual(delayed_match.timing_offset, 1)
+        self.assertLess(delayed_match.timing_weight, 1.0)
+
+        missed_match = env.task.match_score_onset(window + 1, key_id)
+        self.assertIsNone(missed_match.matched_t_idx)
+        self.assertIsNone(missed_match.gt_true_onset_midi_vel)
+        self.assertEqual(missed_match.timing_weight, 0.0)
+
+    def test_match_score_onset_does_not_reuse_consumed_gt_onset(self) -> None:
+        env = _get_env(control_timestep=0.01, velocity_onset_window_steps=2)
+        key_id = midi_file.note_name_to_key_number("C6")
+
+        first_match = env.task.match_score_onset(1, key_id, used_t_idxs=set())
+        self.assertEqual(first_match.matched_t_idx, 0)
+        self.assertEqual(first_match.gt_true_onset_midi_vel, 80)
+
+        consumed_match = env.task.match_score_onset(1, key_id, used_t_idxs={0})
+        self.assertIsNone(consumed_match.matched_t_idx)
+        self.assertIsNone(consumed_match.gt_true_onset_midi_vel)
+        self.assertEqual(consumed_match.timing_weight, 0.0)
+
+    def test_match_score_onset_advances_to_next_same_key_onset_after_consumption(self) -> None:
+        env = _get_env(
+            control_timestep=0.01,
+            disable_fingering_reward=True,
+            midi=_get_test_midi_repeated_same_key(dt=0.01),
+            velocity_onset_window_steps=2,
+        )
+        key_id = midi_file.note_name_to_key_number("C6")
+
+        first_match = env.task.match_score_onset(2, key_id, used_t_idxs=set())
+        self.assertEqual(first_match.matched_t_idx, 0)
+        self.assertEqual(first_match.gt_true_onset_midi_vel, 80)
+
+        second_match = env.task.match_score_onset(2, key_id, used_t_idxs={0})
+        self.assertEqual(second_match.matched_t_idx, 4)
+        self.assertEqual(second_match.gt_true_onset_midi_vel, 72)
+        self.assertEqual(second_match.timing_offset, -2)
+        self.assertGreater(second_match.timing_weight, 0.0)
+
+    def test_match_score_onset_blocks_late_match_when_other_key_onset_intervenes(self) -> None:
+        env = _get_env(
+            control_timestep=0.01,
+            disable_fingering_reward=True,
+            midi=_get_test_midi_intervening_other_key(dt=0.01),
+            velocity_onset_window_steps=2,
+        )
+        c6_key_id = midi_file.note_name_to_key_number("C6")
+
+        blocked_match = env.task.match_score_onset(2, c6_key_id, used_t_idxs=set())
+        self.assertIsNone(blocked_match.matched_t_idx)
+        self.assertIsNone(blocked_match.gt_true_onset_midi_vel)
+        self.assertEqual(blocked_match.timing_weight, 0.0)
+
+    def test_key_press_reward_v2_matches_nearby_true_onset_within_window(self) -> None:
+        env = _get_env(control_timestep=0.01, velocity_onset_window_steps=2)
+        env.reset()
+        task = env.task
+        key_id = midi_file.note_name_to_key_number("C6")
+
+        task._goal_current = np.zeros((task.piano.n_keys + 1,), dtype=np.float64)
+        task._goal_current[key_id] = 1.0
+        task._prev_activation[:] = False
+        task.piano._activation[:] = False
+        task.piano._activation[key_id] = True
+        task.piano._state[:] = 0.0
+        task.piano._state[key_id] = task.piano._qpos_range[key_id, 1]
+        task.piano._onset_velocities[:] = 0.0
+        task.piano._onset_velocities[key_id] = 2.0
+
+        task._t_idx = 2
+        task._compute_key_press_reward_v2(env.physics)
+        self.assertEqual(task._key_onset_gt_vel[key_id], 80)
+        self.assertLess(task._key_onset_timing_weight[key_id], 1.0)
+
+        task._key_onset_gt_vel[key_id] = -999.0
+        task._key_onset_timing_weight[key_id] = -999.0
+        task._t_idx = task._velocity_onset_window_steps + 4
+        task._compute_key_press_reward_v2(env.physics)
+        self.assertEqual(task._key_onset_gt_vel[key_id], -1.0)
+        self.assertEqual(task._key_onset_timing_weight[key_id], 0.0)
+
+    def test_key_press_reward_v2_does_not_carry_velocity_penalty_into_hold(self) -> None:
+        env = _get_env(control_timestep=0.01)
+        env.reset()
+        task = env.task
+        key_id = midi_file.note_name_to_key_number("C6")
+
+        task._goal_current = np.zeros((task.piano.n_keys + 1,), dtype=np.float64)
+        task._goal_current[key_id] = 1.0
+        task.piano._state[:] = 0.0
+        task.piano._state[key_id] = task.piano._qpos_range[key_id, 1]
+        task.piano._activation[:] = False
+        task.piano._activation[key_id] = True
+        task.piano._onset_velocities[:] = 0.0
+
+        # True onset with extremely soft strike should reduce only the onset-step reward.
+        task._prev_activation[:] = False
+        task._t_idx = 1
+        task.piano._onset_velocities[key_id] = _QVEL_MIN
+        onset_rew = task._compute_key_press_reward_v2(env.physics)
+
+        # Holding the same key on the next step should recover to the pure key-press reward.
+        task._prev_activation[:] = task.piano._activation.copy()
+        task._t_idx = 2
+        hold_rew = task._compute_key_press_reward_v2(env.physics)
+
+        self.assertLess(onset_rew, 1.0)
+        self.assertAlmostEqual(hold_rew, 1.0)
 
     def test_failure_termination(self) -> None:
         env = _get_env(wrong_press_termination=True)

@@ -425,6 +425,21 @@ class ShadowHandObservables(base.HandObservables):
         return observable.Generic(raw_observation_callable=_get_fingertip_positions)
 
     @composer.observable
+    def fingertip_velocity(self):
+        """Returns fingertip linear velocities in world coordinates."""
+
+        def _get_fingertip_velocity(physics: mjcf.Physics) -> np.ndarray:
+            velocities = []
+            for fingertip_site in self._entity.fingertip_sites:
+                linear_velocity, _ = physics.data.object_velocity(
+                    fingertip_site.full_identifier, "site"
+                )
+                velocities.append(linear_velocity)
+            return np.concatenate(velocities)
+
+        return observable.Generic(raw_observation_callable=_get_fingertip_velocity)
+
+    @composer.observable
     def fingertip_force(self):
         """Returns for each finger, the sum of forces felt at the fingertip."""
 

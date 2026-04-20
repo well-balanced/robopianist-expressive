@@ -10,5 +10,7 @@ pig_single_finger/
 tmp/
 PianoFingeringDataset_v1.2/
 CLAUDE.md
+.codex
+AGENTS.md
 prompts.py
 test_prompts.py
