@@ -36,11 +36,24 @@
   - matched true onset에만 reward가 붙기 때문에 held note stability, retrigger, early release를 직접 벌주지 못한다.
   - onset velocity는 좋아질 수 있지만, articulation/sustain 품질은 별도로 깨질 수 있다.
 
+### v2.1
+
+- `v2.1`은 `v2.0`의 onset-accuracy 구조를 유지하면서 hold-stability penalty를 추가한 버전이다.
+- 새로 추가된 penalty는 두 가지다.
+  - score상 이미 hold 상태여야 하는 key에서 robot이 새 onset을 만든 경우 penalty
+  - score상 아직 active여야 하는 key를 robot이 release한 경우 penalty
+- 목적:
+  - `v2.0`에서 관찰된 late initial onset, held-note retrigger, premature release dead zone을 막기 위해서다.
+  - onset velocity 성능은 유지하면서 articulation/sustain 품질을 함께 올리기 위해서다.
+- 현재 고정 penalty 계수:
+  - unexpected hold onset: `0.75`
+  - premature release: `0.50`
+
 ### 실행 토글
 
-- 현재 학습 실행 시 이름에는 reward 버전을 `v1.0`, `v2.0`처럼 표시한다.
+- 현재 학습 실행 시 이름에는 reward 버전을 `v1.0`, `v2.0`, `v2.1`처럼 표시한다.
 - `train.py`에서는 `use_velocity_reward_v2: bool = False` 인자를 통해 reward 버전을 선택한다.
-- 기본 실행은 `v1.0`, `--use-velocity-reward-v2`를 추가하면 `v2.0`이다.
+- 기본 실행은 `v1.0`, `--use-velocity-reward-v2`를 추가하면 현재 코드 기준으로 `v2.1` 경로를 사용한다.
 
 ### 기타 관련 변경
 

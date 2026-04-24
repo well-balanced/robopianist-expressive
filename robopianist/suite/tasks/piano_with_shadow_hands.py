@@ -46,6 +46,8 @@ _KEY_PRESS_REWARD_COEF = 1.0
 
 # Velocity reward coefficient.
 _VELOCITY_REWARD_COEF = 1.0
+_VELOCITY_V2_UNEXPECTED_HOLD_ONSET_PENALTY = 0.75
+_VELOCITY_V2_PREMATURE_RELEASE_PENALTY = 0.50
 
 
 # Transparency of fingertip geoms.
@@ -491,31 +493,40 @@ class PianoWithShadowHands(base.PianoTask):
         return self._velocity_reward_coef * float(np.mean(rewards))
 
     def _compute_velocity_reward_v2(self, physics: mjcf.Physics) -> float:
-        """Matched-onset reward with absolute accuracy, contour, and bias terms.
+        """Matched-onset reward with hold-stability penalties.
 
         Flow:
         1. detect robot onsets with `activation & ~prev_activation`
-        2. keep only keys that are also GT true onsets at this timestep
-        3. score absolute onset velocity accuracy with `tolerance()`
-        4. add a local contour term from the previous matched-onset step
-        5. add a small penalty if recent matched-onset errors drift to one side
+        2. detect releases with `~activation & prev_activation`
+        3. reward matched GT true onsets for velocity accuracy
+        4. penalize an onset if the score says the key should already be held
+        5. penalize a release if the score still expects the key to stay active
+        6. add local contour and short-window bias terms on matched onsets only
         """
         del physics  # Unused.
 
-        new_onsets = self.piano.activation & ~self._prev_activation
-        if not new_onsets.any():
-            return 0.0
+        activation = self.piano.activation
+        new_onsets = activation & ~self._prev_activation
+        releases = ~activation & self._prev_activation
 
         t = self._t_idx - 1
+        gt_active_velocity_map = self._score_active_velocity_map(t)
         gt_true_onset_velocity_map = self._score_true_onset_velocity_map(t)
 
         matched_robot_vels: List[int] = []
         matched_gt_vels: List[int] = []
         abs_rewards: List[float] = []
+        unexpected_hold_onset_count = 0
 
         for key in np.flatnonzero(new_onsets):
-            gt_vel = gt_true_onset_velocity_map.get(int(key))
+            key_id = int(key)
+            gt_vel = gt_true_onset_velocity_map.get(key_id)
             if gt_vel is None:
+                # This branch captures the exact failure mode we saw in traces:
+                # the score still wants the note to be active, but the robot
+                # created a fresh onset instead of smoothly keeping it held.
+                if key_id in gt_active_velocity_map:
+                    unexpected_hold_onset_count += 1
                 continue
 
             robot_qvel = float(self.piano._onset_velocities[key])
@@ -544,61 +555,73 @@ class PianoWithShadowHands(base.PianoTask):
             matched_gt_vels.append(gt_vel)
             abs_rewards.append(2.0 * float(abs_accuracy) - 1.0)
 
-        if not matched_robot_vels:
-            return 0.0
+        premature_release_count = sum(
+            1 for key in np.flatnonzero(releases) if int(key) in gt_active_velocity_map
+        )
+
+        abs_reward = float(np.mean(abs_rewards)) if abs_rewards else 0.0
 
         # Chords produce multiple onsets in one step, so v2 first compresses that
         # step to a mean velocity before comparing it against recent history.
-        step_robot_mean = float(np.mean(matched_robot_vels))
-        step_gt_mean = float(np.mean(matched_gt_vels))
-        step_error = step_robot_mean - step_gt_mean
-
-        if (
-            self._prev_velocity_reward_robot_mean is None
-            or self._prev_velocity_reward_gt_mean is None
-        ):
+        if not matched_robot_vels:
             contour_reward = 0.0
+            bias_reward = 0.0
+            extreme_weight = 1.0
         else:
-            robot_delta = step_robot_mean - self._prev_velocity_reward_robot_mean
-            gt_delta = step_gt_mean - self._prev_velocity_reward_gt_mean
-            if abs(gt_delta) < 4.0:
+            step_robot_mean = float(np.mean(matched_robot_vels))
+            step_gt_mean = float(np.mean(matched_gt_vels))
+            step_error = step_robot_mean - step_gt_mean
+
+            if (
+                self._prev_velocity_reward_robot_mean is None
+                or self._prev_velocity_reward_gt_mean is None
+            ):
                 contour_reward = 0.0
             else:
-                contour_reward = float(
-                    np.tanh(robot_delta / 8.0) * np.tanh(gt_delta / 8.0)
+                robot_delta = step_robot_mean - self._prev_velocity_reward_robot_mean
+                gt_delta = step_gt_mean - self._prev_velocity_reward_gt_mean
+                if abs(gt_delta) < 4.0:
+                    contour_reward = 0.0
+                else:
+                    contour_reward = float(
+                        np.tanh(robot_delta / 8.0) * np.tanh(gt_delta / 8.0)
+                    )
+
+            if len(self._recent_velocity_reward_errors) < 2:
+                bias_reward = 0.0
+            else:
+                recent_errors = self._recent_velocity_reward_errors + [step_error]
+                recent_bias = float(np.mean(recent_errors))
+                bias_reward = -min(abs(recent_bias) / 15.0, 1.0)
+
+            extreme_weight = float(
+                np.mean(
+                    [
+                        1.0
+                        + 0.5
+                        * min(abs(gt_vel - self._piece_velocity_median) / 20.0, 1.0)
+                        for gt_vel in matched_gt_vels
+                    ]
                 )
-
-        if len(self._recent_velocity_reward_errors) < 2:
-            bias_reward = 0.0
-        else:
-            recent_errors = self._recent_velocity_reward_errors + [step_error]
-            recent_bias = float(np.mean(recent_errors))
-            bias_reward = -min(abs(recent_bias) / 15.0, 1.0)
-
-        extreme_weight = float(
-            np.mean(
-                [
-                    1.0
-                    + 0.5
-                    * min(abs(gt_vel - self._piece_velocity_median) / 20.0, 1.0)
-                    for gt_vel in matched_gt_vels
-                ]
             )
+
+            self._prev_velocity_reward_robot_mean = step_robot_mean
+            self._prev_velocity_reward_gt_mean = step_gt_mean
+            self._recent_velocity_reward_errors.append(step_error)
+            if len(self._recent_velocity_reward_errors) > 4:
+                self._recent_velocity_reward_errors.pop(0)
+
+        hold_stability_penalty = (
+            _VELOCITY_V2_UNEXPECTED_HOLD_ONSET_PENALTY * unexpected_hold_onset_count
+            + _VELOCITY_V2_PREMATURE_RELEASE_PENALTY * premature_release_count
         )
 
         raw_reward = extreme_weight * (
-            float(np.mean(abs_rewards))
+            abs_reward
             + 0.35 * contour_reward
             + 0.15 * bias_reward
-        )
+        ) - hold_stability_penalty
         clipped_reward = float(np.clip(raw_reward, -1.5, 1.5))
-
-        self._prev_velocity_reward_robot_mean = step_robot_mean
-        self._prev_velocity_reward_gt_mean = step_gt_mean
-        self._recent_velocity_reward_errors.append(step_error)
-        if len(self._recent_velocity_reward_errors) > 4:
-            self._recent_velocity_reward_errors.pop(0)
-
         return self._velocity_reward_coef * clipped_reward
 
     def _compute_fingering_reward(self, physics: mjcf.Physics) -> float:
