@@ -47,7 +47,6 @@ _KEY_PRESS_REWARD_COEF = 1.0
 # Velocity reward coefficient.
 _VELOCITY_REWARD_COEF = 1.0
 
-_ONSET_TIMING_VALUE_AT_MARGIN = 0.1
 
 # Transparency of fingertip geoms.
 _FINGERTIP_ALPHA = 1.0
@@ -66,13 +65,6 @@ class ScoreKeyMetadata(NamedTuple):
     gt_true_onset_midi_vel: Optional[int]
 
 
-class ScoreOnsetMatch(NamedTuple):
-    """Nearest GT onset match for a robot onset event."""
-
-    matched_t_idx: Optional[int]
-    gt_true_onset_midi_vel: Optional[int]
-    timing_offset: Optional[int]
-    timing_weight: float
 
 
 class PianoWithShadowHands(base.PianoTask):
@@ -94,10 +86,9 @@ class PianoWithShadowHands(base.PianoTask):
         randomize_hand_positions: bool = False,
         velocity_reward_coef: float = _VELOCITY_REWARD_COEF,
         disable_velocity_reward: bool = False,
-        use_key_press_v2: bool = False,
-        velocity_onset_window_steps: int = 0,
+        use_velocity_reward_v2: bool = False,
         n_steps_velocity_lookahead: int = 3,
-        velocity_obs_mode: Optional[str] = None,
+        compact_residual_obs: bool = False,
         **kwargs,
     ) -> None:
         """Task constructor.
@@ -125,6 +116,8 @@ class PianoWithShadowHands(base.PianoTask):
                 and corresponding keys.
             disable_hand_collisions: If True, disables collisions between the two hands.
             disable_velocity_reward: If True, disables the velocity reward term.
+            use_velocity_reward_v2: If True, switches the velocity reward term from
+                the original onset reward to the matched-onset v2 reward.
             augmentations: A list of `Variation` objects that will be applied to the
                 MIDI file at the beginning of each episode. If None, no augmentations
                 will be applied.
@@ -137,14 +130,6 @@ class PianoWithShadowHands(base.PianoTask):
                 hands at the beginning of each episode.
             n_steps_velocity_lookahead: Number of timesteps to look ahead in the
                 velocity goal observable. Independent of n_steps_lookahead.
-            velocity_obs_mode: Controls what velocity information is added to
-                observations. One of:
-                - None: no velocity observation (default).
-                - "current": GT velocity for the current step only (88 dims).
-                - "lookahead": GT velocity for current + n_steps_velocity_lookahead
-                  future steps, flattened ((n_steps_velocity_lookahead+1)*88 dims).
-                - "scaled_goal": goal state with binary 1.0 replaced by
-                  velocity/127.0; same shape as the regular goal observable.
         """
         super().__init__(arena=stage.Stage(), **kwargs)
 
@@ -164,16 +149,15 @@ class PianoWithShadowHands(base.PianoTask):
         self._disable_forearm_reward = disable_forearm_reward
         self._velocity_reward_coef = velocity_reward_coef
         self._disable_velocity_reward = disable_velocity_reward
+        self._use_velocity_reward_v2 = use_velocity_reward_v2
         self._n_steps_velocity_lookahead = n_steps_velocity_lookahead
-        self._velocity_obs_mode = velocity_obs_mode
         self._wrong_press_termination = wrong_press_termination
         self._disable_colorization = disable_colorization
         self._disable_hand_collisions = disable_hand_collisions
         self._augmentations = augmentations
         self._energy_penalty_coef = energy_penalty_coef
         self._key_press_reward_coef = key_press_reward_coef
-        self._use_key_press_v2 = use_key_press_v2
-        self._velocity_onset_window_steps = velocity_onset_window_steps
+        self._compact_residual_obs = compact_residual_obs
         self._randomize_hand_positions = randomize_hand_positions
         self._velocity_calib = VelocityCalibration.load()
         self._score_active_velocity_maps: List[Dict[int, int]] = []
@@ -189,13 +173,8 @@ class PianoWithShadowHands(base.PianoTask):
         self._set_rewards()
 
     def _set_rewards(self) -> None:
-        key_press_fn = (
-            self._compute_key_press_reward_v2
-            if self._use_key_press_v2
-            else self._compute_key_press_reward
-        )
         self._reward_fn = composite_reward.CompositeReward(
-            key_press_reward=key_press_fn,
+            key_press_reward=self._compute_key_press_reward,
             sustain_reward=self._compute_sustain_reward,
             energy_reward=self._compute_energy_reward,
         )
@@ -209,7 +188,7 @@ class PianoWithShadowHands(base.PianoTask):
         if not self._disable_forearm_reward:
             self._reward_fn.add("forearm_reward", self._compute_forearm_reward)
 
-        if not self._disable_velocity_reward and not self._use_key_press_v2:
+        if not self._disable_velocity_reward:
             self._reward_fn.add("velocity_reward", self._compute_velocity_reward)
 
     def _reset_quantities_at_episode_init(self) -> None:
@@ -225,17 +204,11 @@ class PianoWithShadowHands(base.PianoTask):
         self._velocity_goal_state: np.ndarray = np.zeros(
             (self._n_steps_velocity_lookahead + 1, self.piano.n_keys), dtype=np.float64
         )
-        # GT velocity at the time each key was last pressed (-1 = not currently held).
-        # Used by key_press_reward_v2.
-        self._key_onset_gt_vel: np.ndarray = np.full(
-            self.piano.n_keys, -1, dtype=np.float64
-        )
-        self._key_onset_timing_weight: np.ndarray = np.zeros(
-            self.piano.n_keys, dtype=np.float64
-        )
-        self._matched_gt_onset_timesteps: List[set[int]] = [
-            set() for _ in range(self.piano.n_keys)
-        ]
+        # v2 compares the current matched-onset mean against recent matched-onset
+        # history, so these episode-local accumulators reset every episode.
+        self._prev_velocity_reward_robot_mean: Optional[float] = None
+        self._prev_velocity_reward_gt_mean: Optional[float] = None
+        self._recent_velocity_reward_errors: List[float] = []
 
     def _maybe_change_midi(self, random_state: np.random.RandomState) -> None:
         if self._augmentations is not None:
@@ -270,6 +243,17 @@ class PianoWithShadowHands(base.PianoTask):
             self._score_active_velocity_maps.append(active_velocity_map)
             self._score_true_onset_velocity_maps.append(true_onset_velocity_map)
             prev_active_keys = set(active_velocity_map)
+        # v2 gives a small extra weight to unusually soft/loud score notes, so it
+        # needs the piece-level center of the GT onset velocity distribution.
+        true_onset_velocities = [
+            velocity
+            for velocity_map in self._score_true_onset_velocity_maps
+            for velocity in velocity_map.values()
+        ]
+        if true_onset_velocities:
+            self._piece_velocity_median = float(np.median(true_onset_velocities))
+        else:
+            self._piece_velocity_median = 64.0
 
     def _score_active_velocity_map(self, t_idx: int) -> Dict[int, int]:
         if 0 <= t_idx < len(self._score_active_velocity_maps):
@@ -281,87 +265,6 @@ class PianoWithShadowHands(base.PianoTask):
             return self._score_true_onset_velocity_maps[t_idx]
         return {}
 
-    def _timing_weight_for_offset(self, offset_steps: int) -> float:
-        if self._velocity_onset_window_steps == 0:
-            return 1.0 if offset_steps == 0 else 0.0
-        return float(
-            tolerance(
-                abs(offset_steps),
-                bounds=(0, 0),
-                margin=self._velocity_onset_window_steps,
-                sigmoid="gaussian",
-                value_at_margin=_ONSET_TIMING_VALUE_AT_MARGIN,
-            )
-        )
-
-    def _has_intervening_true_onset_conflict(
-        self,
-        t_idx: int,
-        candidate_t_idx: int,
-        key_id: int,
-    ) -> bool:
-        """Returns True if another GT onset occurs between candidate and robot time.
-
-        Exact-timestep matches are always allowed. For non-zero timing offsets, we
-        disallow matching if another key has a true onset between the GT onset and the
-        robot onset, including the robot timestep itself. This prevents rewarding a
-        late note that spills into a later note's slot.
-        """
-        if candidate_t_idx == t_idx:
-            return False
-
-        if candidate_t_idx < t_idx:
-            timesteps = range(candidate_t_idx + 1, t_idx + 1)
-        else:
-            timesteps = range(t_idx, candidate_t_idx)
-
-        for check_t in timesteps:
-            onset_map = self._score_true_onset_velocity_map(check_t)
-            if any(other_key != key_id for other_key in onset_map):
-                return True
-        return False
-
-    def match_score_onset(
-        self,
-        t_idx: int,
-        key_id: int,
-        used_t_idxs: Optional[set[int]] = None,
-    ) -> ScoreOnsetMatch:
-        """Matches a robot onset to the nearest GT onset within a symmetric window.
-
-        Search order is `0, -1, +1, -2, +2`, which keeps the matching symmetric
-        while preferring an earlier onset when two candidates are equally close.
-        """
-        used_t_idxs = used_t_idxs or set()
-        candidate_steps = [t_idx]
-        for delta in range(1, self._velocity_onset_window_steps + 1):
-            candidate_steps.append(t_idx - delta)
-            candidate_steps.append(t_idx + delta)
-
-        for candidate_t in candidate_steps:
-            if not (0 <= candidate_t < len(self._score_true_onset_velocity_maps)):
-                continue
-            if candidate_t in used_t_idxs:
-                continue
-            gt_vel = self._score_true_onset_velocity_map(candidate_t).get(key_id)
-            if gt_vel is None:
-                continue
-            if self._has_intervening_true_onset_conflict(t_idx, candidate_t, key_id):
-                continue
-            timing_offset = t_idx - candidate_t
-            return ScoreOnsetMatch(
-                matched_t_idx=candidate_t,
-                gt_true_onset_midi_vel=int(gt_vel),
-                timing_offset=timing_offset,
-                timing_weight=self._timing_weight_for_offset(timing_offset),
-            )
-
-        return ScoreOnsetMatch(
-            matched_t_idx=None,
-            gt_true_onset_midi_vel=None,
-            timing_offset=None,
-            timing_weight=0.0,
-        )
 
     def get_score_key_metadata(self, t_idx: int, key_id: int) -> ScoreKeyMetadata:
         """Returns score-side metadata for a key at a timestep.
@@ -519,107 +422,184 @@ class PianoWithShadowHands(base.PianoTask):
         return self._key_press_reward_coef * rew
 
     def _compute_velocity_reward(self, physics: mjcf.Physics) -> float:
-        """Separate velocity reward that fires at new onsets (naive reward shaping).
+        """Compute the configured velocity reward variant.
 
-        Returns coef * mean(1 + calib.reward(robot_vel, gt_vel)) over onset keys,
-        where calib.reward returns -(Δloudness)² in [-1,0] (perceptual loudness space).
-        Returns coef on non-onset steps (no gradient, no penalty).
-        Used when use_key_press_v2=False and disable_velocity_reward=False.
+        The dispatch is explicit here so every caller still uses the same
+        reward name (`velocity_reward`) inside `CompositeReward`, while the
+        actual scoring logic can be switched by a single task flag.
+        """
+        if self._use_velocity_reward_v2:
+            return self._compute_velocity_reward_v2(physics)
+        return self._compute_velocity_reward_v1(physics)
+
+    def _compute_velocity_reward_v1(self, physics: mjcf.Physics) -> float:
+        """Simple matched-onset absolute velocity reward.
+
+        Flow:
+        1. detect robot onsets with `activation & ~prev_activation`
+        2. look up only score *true onsets* at the same timestep
+        3. give 0 on non-onset steps and unmatched robot onsets
+        4. score matched onsets with a sharp `tolerance()` on MIDI velocity
+
+        This keeps v1 intentionally simple:
+        - no contour term
+        - no running bias term
+        - no piece-level extreme weighting
+
+        Compared with the older v1, this removes the overly flat
+        `1 + loudness_calib.reward(...)` shaping and aligns the reward target
+        with the evaluation semantics, which also operate on matched true
+        onsets rather than all score-active keys.
         """
         del physics  # Unused.
         new_onsets = self.piano.activation & ~self._prev_activation
         if not new_onsets.any():
-            return self._velocity_reward_coef
+            return 0.0
 
         t = self._t_idx - 1
-        gt_velocity_map = {note.key: int(note.velocity) for note in self._notes[t]}
+        gt_true_onset_velocity_map = self._score_true_onset_velocity_map(t)
         rewards = []
         for key in np.flatnonzero(new_onsets):
-            gt_vel = gt_velocity_map.get(int(key))
+            gt_vel = gt_true_onset_velocity_map.get(int(key))
             if gt_vel is None:
-                rewards.append(1.0)
+                rewards.append(0.0)
                 continue
             robot_midi_vel = (
-                int(np.clip(
-                    (self.piano._onset_velocities[key] - _QVEL_MIN) / (_MAX_KEY_VEL - _QVEL_MIN) * 126,
-                    0, 126,
-                )) + 1
+                int(
+                    np.clip(
+                        (self.piano._onset_velocities[key] - _QVEL_MIN)
+                        / (_MAX_KEY_VEL - _QVEL_MIN)
+                        * 126,
+                        0,
+                        126,
+                    )
+                )
+                + 1
             )
-            rewards.append(1.0 + self._velocity_calib.reward(robot_midi_vel, gt_vel))
+
+            lo = max(1, gt_vel - 3)
+            hi = min(127, gt_vel + 3)
+            accuracy = tolerance(
+                robot_midi_vel,
+                bounds=(lo, hi),
+                margin=20,
+                sigmoid="gaussian",
+                value_at_margin=0.05,
+            )
+            rewards.append(2.0 * float(accuracy) - 1.0)
+
         return self._velocity_reward_coef * float(np.mean(rewards))
 
-    def _compute_key_press_reward_v2(self, physics: mjcf.Physics) -> float:
-        """Key press reward with onset-only velocity accuracy.
+    def _compute_velocity_reward_v2(self, physics: mjcf.Physics) -> float:
+        """Matched-onset reward with absolute accuracy, contour, and bias terms.
 
-        Position reward remains dense over currently held GT keys, but the velocity
-        factor is applied only on the timestep where the robot creates a new onset.
-        That onset is matched to the nearest same-key GT onset within a symmetric
-        `±2` timestep window, with a Gaussian timing weight that peaks at exact
-        alignment and decays toward the edges. This keeps hold reward and onset
-        velocity reward separate in time, matching evaluation semantics more closely.
+        Flow:
+        1. detect robot onsets with `activation & ~prev_activation`
+        2. keep only keys that are also GT true onsets at this timestep
+        3. score absolute onset velocity accuracy with `tolerance()`
+        4. add a local contour term from the previous matched-onset step
+        5. add a small penalty if recent matched-onset errors drift to one side
         """
         del physics  # Unused.
-        activation = self.piano.activation
-        new_onsets = activation & ~self._prev_activation
-        releases = ~activation & self._prev_activation
 
-        # Update per-key GT velocity tracking.
-        release_keys = np.flatnonzero(releases)
-        self._key_onset_gt_vel[release_keys] = -1
-        self._key_onset_timing_weight[release_keys] = 0.0
-        if new_onsets.any():
-            t = self._t_idx - 1
-            for key in np.flatnonzero(new_onsets):
-                match = self.match_score_onset(
-                    t,
-                    int(key),
-                    used_t_idxs=self._matched_gt_onset_timesteps[key],
-                )
-                self._key_onset_gt_vel[key] = (
-                    match.gt_true_onset_midi_vel
-                    if match.gt_true_onset_midi_vel is not None
-                    else -1
-                )
-                self._key_onset_timing_weight[key] = match.timing_weight
-                if match.matched_t_idx is not None:
-                    self._matched_gt_onset_timesteps[key].add(match.matched_t_idx)
+        new_onsets = self.piano.activation & ~self._prev_activation
+        if not new_onsets.any():
+            return 0.0
 
-        on = np.flatnonzero(self._goal_current[:-1])
-        rew = 0.0
-        if on.size > 0:
-            actual = np.array(self.piano.state / self.piano._qpos_range[:, 1])
-            pos_scores = tolerance(
-                self._goal_current[:-1][on] - actual[on],
-                bounds=(0, _KEY_CLOSE_ENOUGH_TO_PRESSED),
-                margin=(_KEY_CLOSE_ENOUGH_TO_PRESSED * 10),
-                sigmoid="gaussian",
-            )
-            blended_scores = np.array(pos_scores, copy=True)
-            if not self._disable_velocity_reward:
-                on_index = {int(key): i for i, key in enumerate(on)}
-                for key in np.flatnonzero(new_onsets):
-                    i = on_index.get(int(key))
-                    if i is None:
-                        continue
-                    gt_vel = self._key_onset_gt_vel[key]
-                    if gt_vel == -1:
-                        continue
-                    timing_weight = float(self._key_onset_timing_weight[key])
-                    robot_midi_vel = (
-                        int(np.clip(
-                            (self.piano._onset_velocities[key] - _QVEL_MIN) / (_MAX_KEY_VEL - _QVEL_MIN) * 126,
-                            0, 126
-                        )) + 1
+        t = self._t_idx - 1
+        gt_true_onset_velocity_map = self._score_true_onset_velocity_map(t)
+
+        matched_robot_vels: List[int] = []
+        matched_gt_vels: List[int] = []
+        abs_rewards: List[float] = []
+
+        for key in np.flatnonzero(new_onsets):
+            gt_vel = gt_true_onset_velocity_map.get(int(key))
+            if gt_vel is None:
+                continue
+
+            robot_qvel = float(self.piano._onset_velocities[key])
+            robot_midi_vel = (
+                int(
+                    np.clip(
+                        (robot_qvel - _QVEL_MIN) / (_MAX_KEY_VEL - _QVEL_MIN) * 126,
+                        0,
+                        126,
                     )
-                    vel_factor = 1.0 + self._velocity_calib.reward(robot_midi_vel, int(gt_vel))
-                    onset_factor = timing_weight * vel_factor
-                    blended = 1.0 - self._velocity_reward_coef * (1.0 - onset_factor)
-                    blended_scores[i] *= blended
-            rew += 0.5 * float(np.mean(blended_scores))
+                )
+                + 1
+            )
 
-        off = np.flatnonzero(1 - self._goal_current[:-1])
-        rew += 0.5 * (1 - float(self.piano.activation[off].any()))
-        return self._key_press_reward_coef * rew
+            lo = max(1, gt_vel - 3)
+            hi = min(127, gt_vel + 3)
+            abs_accuracy = tolerance(
+                robot_midi_vel,
+                bounds=(lo, hi),
+                margin=20,
+                sigmoid="gaussian",
+                value_at_margin=0.05,
+            )
+
+            matched_robot_vels.append(robot_midi_vel)
+            matched_gt_vels.append(gt_vel)
+            abs_rewards.append(2.0 * float(abs_accuracy) - 1.0)
+
+        if not matched_robot_vels:
+            return 0.0
+
+        # Chords produce multiple onsets in one step, so v2 first compresses that
+        # step to a mean velocity before comparing it against recent history.
+        step_robot_mean = float(np.mean(matched_robot_vels))
+        step_gt_mean = float(np.mean(matched_gt_vels))
+        step_error = step_robot_mean - step_gt_mean
+
+        if (
+            self._prev_velocity_reward_robot_mean is None
+            or self._prev_velocity_reward_gt_mean is None
+        ):
+            contour_reward = 0.0
+        else:
+            robot_delta = step_robot_mean - self._prev_velocity_reward_robot_mean
+            gt_delta = step_gt_mean - self._prev_velocity_reward_gt_mean
+            if abs(gt_delta) < 4.0:
+                contour_reward = 0.0
+            else:
+                contour_reward = float(
+                    np.tanh(robot_delta / 8.0) * np.tanh(gt_delta / 8.0)
+                )
+
+        if len(self._recent_velocity_reward_errors) < 2:
+            bias_reward = 0.0
+        else:
+            recent_errors = self._recent_velocity_reward_errors + [step_error]
+            recent_bias = float(np.mean(recent_errors))
+            bias_reward = -min(abs(recent_bias) / 15.0, 1.0)
+
+        extreme_weight = float(
+            np.mean(
+                [
+                    1.0
+                    + 0.5
+                    * min(abs(gt_vel - self._piece_velocity_median) / 20.0, 1.0)
+                    for gt_vel in matched_gt_vels
+                ]
+            )
+        )
+
+        raw_reward = extreme_weight * (
+            float(np.mean(abs_rewards))
+            + 0.35 * contour_reward
+            + 0.15 * bias_reward
+        )
+        clipped_reward = float(np.clip(raw_reward, -1.5, 1.5))
+
+        self._prev_velocity_reward_robot_mean = step_robot_mean
+        self._prev_velocity_reward_gt_mean = step_gt_mean
+        self._recent_velocity_reward_errors.append(step_error)
+        if len(self._recent_velocity_reward_errors) > 4:
+            self._recent_velocity_reward_errors.pop(0)
+
+        return self._velocity_reward_coef * clipped_reward
 
     def _compute_fingering_reward(self, physics: mjcf.Physics) -> float:
         """Reward for minimizing the distance between the fingers and the keys."""
@@ -797,6 +777,7 @@ class PianoWithShadowHands(base.PianoTask):
             # slider joints (which are in units of meters).
             # "position",
         ]
+        enabled_observables.append("joints_vel")
         for hand in [self.right_hand, self.left_hand]:
             for obs in enabled_observables:
                 getattr(hand.observables, obs).enabled = True
@@ -805,16 +786,12 @@ class PianoWithShadowHands(base.PianoTask):
         self.piano.observables.state.enabled = True
         self.piano.observables.sustain_state.enabled = True
 
-        # This returns the goal state for the current timestep and n steps ahead.
-        # In "scaled_goal" mode the binary 1.0 entries are replaced by velocity/127
-        # so the agent sees target intensity directly; _goal_state stays binary for
-        # reward computation.
+        # Goal state: binary 1.0 entries replaced by velocity/127 (scaled_goal).
+        # _goal_state stays binary for reward computation.
         def _get_goal_state(physics) -> np.ndarray:
             del physics  # Unused.
             self._update_goal_state()
-            if self._velocity_obs_mode == "scaled_goal":
-                return self._get_velocity_scaled_goal_state().ravel()
-            return self._goal_state.ravel()
+            return self._get_velocity_scaled_goal_state().ravel()
 
         goal_observable = observable.Generic(_get_goal_state)
         goal_observable.enabled = True
@@ -838,32 +815,24 @@ class PianoWithShadowHands(base.PianoTask):
         fingering_velocity_observable.enabled = False
         self._task_observables["fingering_velocity"] = fingering_velocity_observable
 
-        # Velocity observation — controlled by velocity_obs_mode.
-        # "current":     GT velocity for current step only, shape (88,).
-        # "lookahead":   GT velocity for current + future steps,
-        #                shape ((n_steps_velocity_lookahead+1)*88,).
-        # "scaled_goal": goal state where 1.0 → velocity/127, same shape as goal.
-        if self._velocity_obs_mode == "current":
-            def _get_velocity_obs(physics) -> np.ndarray:
-                del physics
+        # Compact residual obs: velocity lookahead + piano state + hand kinematics.
+        # Appended at the END of the obs vector so obs[:base_obs_dim] stays intact.
+        # Shape: (n_steps_velocity_lookahead+1)*88 + 88 + 1 + 23*4 = 621 (default 4-step).
+        if self._compact_residual_obs:
+            def _get_compact_residual_obs(physics) -> np.ndarray:
                 self._update_velocity_goal_state()
-                return self._velocity_goal_state[0]  # (88,)
+                vel = self._velocity_goal_state.ravel()
+                piano_state = self.piano._state.copy()
+                sustain = self.piano._sustain_state.copy()
+                rh_pos = physics.bind(self.right_hand.joints).qpos.copy()
+                lh_pos = physics.bind(self.left_hand.joints).qpos.copy()
+                rh_vel = physics.bind(self.right_hand.joints).qvel.copy()
+                lh_vel = physics.bind(self.left_hand.joints).qvel.copy()
+                return np.concatenate([vel, piano_state, sustain, rh_pos, lh_pos, rh_vel, lh_vel])
 
-            vel_obs = observable.Generic(_get_velocity_obs)
-            vel_obs.enabled = True
-            self._task_observables["velocity_obs"] = vel_obs
-
-        elif self._velocity_obs_mode == "lookahead":
-            def _get_velocity_obs(physics) -> np.ndarray:
-                del physics
-                self._update_velocity_goal_state()
-                return self._velocity_goal_state.ravel()  # ((n+1)*88,)
-
-            vel_obs = observable.Generic(_get_velocity_obs)
-            vel_obs.enabled = True
-            self._task_observables["velocity_obs"] = vel_obs
-
-        # "scaled_goal" is handled above by overriding the goal observable itself.
+            compact_obs = observable.Generic(_get_compact_residual_obs)
+            compact_obs.enabled = True
+            self._task_observables["compact_residual_obs"] = compact_obs
 
     def _colorize_fingertips(self) -> None:
         """Colorize the fingertips of the hands."""
