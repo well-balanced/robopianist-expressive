@@ -30,7 +30,6 @@ import robopianist.models.hands.shadow_hand_constants as hand_consts
 from robopianist.models.arenas import stage
 from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL, QVEL_MIN as _QVEL_MIN
 from robopianist.music import midi_file
-from robopianist.music.velocity_calibration import VelocityCalibration
 from robopianist.suite import composite_reward
 from robopianist.suite.tasks import base
 
@@ -46,8 +45,9 @@ _KEY_PRESS_REWARD_COEF = 1.0
 
 # Velocity reward coefficient.
 _VELOCITY_REWARD_COEF = 1.0
-_VELOCITY_V2_UNEXPECTED_HOLD_ONSET_PENALTY = 0.75
-_VELOCITY_V2_PREMATURE_RELEASE_PENALTY = 0.50
+_VELOCITY_V2_HOLD_PENALTY_GRACE_STEPS = 2
+_VELOCITY_V2_UNEXPECTED_HOLD_ONSET_PENALTY = 0.20
+_VELOCITY_V2_PREMATURE_RELEASE_PENALTY = 0.10
 
 
 # Transparency of fingertip geoms.
@@ -88,6 +88,7 @@ class PianoWithShadowHands(base.PianoTask):
         randomize_hand_positions: bool = False,
         velocity_reward_coef: float = _VELOCITY_REWARD_COEF,
         disable_velocity_reward: bool = False,
+        velocity_reward_version: str = "v1.0",
         use_velocity_reward_v2: bool = False,
         n_steps_velocity_lookahead: int = 3,
         compact_residual_obs: bool = False,
@@ -118,8 +119,12 @@ class PianoWithShadowHands(base.PianoTask):
                 and corresponding keys.
             disable_hand_collisions: If True, disables collisions between the two hands.
             disable_velocity_reward: If True, disables the velocity reward term.
-            use_velocity_reward_v2: If True, switches the velocity reward term from
-                the original onset reward to the matched-onset v2 reward.
+            velocity_reward_version: Legacy launch string for the velocity reward
+                path. For backward compatibility, strings starting with `"v2"`
+                select the current v2 reward and all other values select the
+                current v1 reward.
+            use_velocity_reward_v2: If True, forces the current v2 reward path.
+                Kept for backward compatibility with older launch commands.
             augmentations: A list of `Variation` objects that will be applied to the
                 MIDI file at the beginning of each episode. If None, no augmentations
                 will be applied.
@@ -151,7 +156,9 @@ class PianoWithShadowHands(base.PianoTask):
         self._disable_forearm_reward = disable_forearm_reward
         self._velocity_reward_coef = velocity_reward_coef
         self._disable_velocity_reward = disable_velocity_reward
-        self._use_velocity_reward_v2 = use_velocity_reward_v2
+        self._use_velocity_reward_v2 = (
+            use_velocity_reward_v2 or velocity_reward_version.startswith("v2")
+        )
         self._n_steps_velocity_lookahead = n_steps_velocity_lookahead
         self._wrong_press_termination = wrong_press_termination
         self._disable_colorization = disable_colorization
@@ -161,7 +168,6 @@ class PianoWithShadowHands(base.PianoTask):
         self._key_press_reward_coef = key_press_reward_coef
         self._compact_residual_obs = compact_residual_obs
         self._randomize_hand_positions = randomize_hand_positions
-        self._velocity_calib = VelocityCalibration.load()
         self._score_active_velocity_maps: List[Dict[int, int]] = []
         self._score_true_onset_velocity_maps: List[Dict[int, int]] = []
 
@@ -424,11 +430,10 @@ class PianoWithShadowHands(base.PianoTask):
         return self._key_press_reward_coef * rew
 
     def _compute_velocity_reward(self, physics: mjcf.Physics) -> float:
-        """Compute the configured velocity reward variant.
+        """Compute the current velocity reward.
 
-        The dispatch is explicit here so every caller still uses the same
-        reward name (`velocity_reward`) inside `CompositeReward`, while the
-        actual scoring logic can be switched by a single task flag.
+        The codebase only keeps the latest v1 and v2 implementations in-tree.
+        Older variants live in git history, not as runtime branches.
         """
         if self._use_velocity_reward_v2:
             return self._compute_velocity_reward_v2(physics)
@@ -502,6 +507,11 @@ class PianoWithShadowHands(base.PianoTask):
         4. penalize an onset if the score says the key should already be held
         5. penalize a release if the score still expects the key to stay active
         6. add local contour and short-window bias terms on matched onsets only
+
+        The first couple of control steps are exempt from hold penalties.
+        Twinkle starts with notes that are already active because of
+        `initial_buffer_time`, so penalizing those steps directly makes the
+        reward collapse before the policy even reaches the main phrase.
         """
         del physics  # Unused.
 
@@ -510,6 +520,7 @@ class PianoWithShadowHands(base.PianoTask):
         releases = ~activation & self._prev_activation
 
         t = self._t_idx - 1
+        penalize_hold_stability = t >= _VELOCITY_V2_HOLD_PENALTY_GRACE_STEPS
         gt_active_velocity_map = self._score_active_velocity_map(t)
         gt_true_onset_velocity_map = self._score_true_onset_velocity_map(t)
 
@@ -525,7 +536,7 @@ class PianoWithShadowHands(base.PianoTask):
                 # This branch captures the exact failure mode we saw in traces:
                 # the score still wants the note to be active, but the robot
                 # created a fresh onset instead of smoothly keeping it held.
-                if key_id in gt_active_velocity_map:
+                if penalize_hold_stability and key_id in gt_active_velocity_map:
                     unexpected_hold_onset_count += 1
                 continue
 
@@ -555,8 +566,14 @@ class PianoWithShadowHands(base.PianoTask):
             matched_gt_vels.append(gt_vel)
             abs_rewards.append(2.0 * float(abs_accuracy) - 1.0)
 
-        premature_release_count = sum(
-            1 for key in np.flatnonzero(releases) if int(key) in gt_active_velocity_map
+        premature_release_count = (
+            sum(
+                1
+                for key in np.flatnonzero(releases)
+                if int(key) in gt_active_velocity_map
+            )
+            if penalize_hold_stability
+            else 0
         )
 
         abs_reward = float(np.mean(abs_rewards)) if abs_rewards else 0.0

@@ -8,8 +8,7 @@
 ### v1.0
 
 - velocity reward를 `v1 / v2`로 분리하고, 기본값은 `v1.0`으로 유지했다.
-- `PianoWithShadowHands`에서 `use_velocity_reward_v2: bool = False` 플래그를 추가했다.
-- `_compute_velocity_reward()`는 내부에서 `v1` 또는 `v2`로 분기하도록 변경했다.
+- `PianoWithShadowHands`에서 reward 버전에 따라 velocity reward 경로를 분기할 수 있게 했다.
 - 현재 `v1.0`은 다음 규칙으로 동작한다.
   - robot의 새 onset만 본다.
   - non-onset step reward는 `0.0`이다.
@@ -20,6 +19,18 @@
 - 목적:
   - 기존 loudness 기반 reward가 너무 완만해서 큰 velocity 오차에도 reward가 거의 유지되던 문제를 줄이기 위해서다.
   - reward semantics를 evaluation의 true onset 기준과 더 가깝게 맞추기 위해서다.
+
+### v1.0.1
+
+- `v1.0.1`은 `v1.0`의 onset-only / true-onset-only semantics는 유지하면서, raw MIDI diff 대신 loudness space에서 오차를 보는 버전이다.
+- 계산 흐름:
+  - robot 새 onset만 본다.
+  - GT true onset과 매칭된 key만 reward를 계산한다.
+  - `VelocityCalibration.loudness_db()`로 robot/GT velocity를 loudness 공간으로 보낸 뒤,
+    `|loudness(robot) - loudness(gt)|`를 sharp한 `tolerance()` 곡선으로 점수화한다.
+- 목적:
+  - velocity 차이가 구간마다 다르게 들리는 perceptual 차이를 reward에 반영하기 위해서다.
+  - 기존 loudness reward의 의미는 유지하면서, 예전 formulation보다 훨씬 날카로운 gradient를 주기 위해서다.
 
 ### v2.0
 
@@ -49,11 +60,26 @@
   - unexpected hold onset: `0.75`
   - premature release: `0.50`
 
+### v2.1.1
+
+- `v2.1.1`은 `v2.1`의 구조는 유지하고, hold penalty scale mismatch만 줄이는 최소 수정 버전이다.
+- 변경점:
+  - episode 시작 직후 몇 step은 hold penalty를 계산하지 않는다.
+  - 목적은 `initial_buffer_time` 때문에 score상 이미 눌려 있어야 하는 음을 시작부에서 늦게 누르는 현상을 unfair penalty로 세게 때리지 않기 위해서다.
+  - unexpected hold onset penalty를 `0.75 -> 0.20`으로 낮췄다.
+  - premature release penalty를 `0.50 -> 0.10`으로 낮췄다.
+- 목적:
+  - 예전 `v2 coef=1.0`과 비교할 때, hold penalty가 objective 전체를 뒤집어버리는 문제를 줄이기 위해서다.
+  - held-note retrigger / premature release는 여전히 억제하되, onset velocity 학습 자체를 덮어버리지는 않게 하려는 조정이다.
+
 ### 실행 토글
 
-- 현재 학습 실행 시 이름에는 reward 버전을 `v1.0`, `v2.0`, `v2.1`처럼 표시한다.
-- `train.py`에서는 `use_velocity_reward_v2: bool = False` 인자를 통해 reward 버전을 선택한다.
-- 기본 실행은 `v1.0`, `--use-velocity-reward-v2`를 추가하면 현재 코드 기준으로 `v2.1` 경로를 사용한다.
+- 실행 이름에는 실험 당시의 reward 버전을 그대로 표시한다. 예: `v1.0`, `v1.0.1`, `v2.1`, `v2.1.1`
+- 다만 코드 안에는 예전 버전을 계속 분기해서 남기지 않는다.
+- 현재 소스는 `현재 v1`과 `현재 v2` 두 경로만 유지한다.
+- 예전 세부 버전 구현은 git history와 이 문서로 추적한다.
+- 기존 `--use-velocity-reward-v2` 플래그는 backward compatibility용으로 유지된다.
+- `velocity_reward_version` 문자열 인자도 launch 호환성 때문에 받을 수는 있지만, 현재 코드는 `v2*` 문자열이면 최신 v2 경로를, 그 외는 최신 v1 경로를 사용한다.
 
 ### 기타 관련 변경
 
