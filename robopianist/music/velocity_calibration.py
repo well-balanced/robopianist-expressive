@@ -101,4 +101,4 @@ class VelocityCalibration:
         Uses the dB scale for perceptually uniform gradient.
         """
         delta = self.loudness_db(achieved_vel) - self.loudness_db(target_vel)
-        return -float(delta * delta)
+        return -float(abs(delta))

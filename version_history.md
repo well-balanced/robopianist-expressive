@@ -41,3 +41,9 @@
 - 현재 학습 실행 시 이름에는 reward 버전을 `v1.0`, `v2.0`처럼 표시한다.
 - `train.py`에서는 `use_velocity_reward_v2: bool = False` 인자를 통해 reward 버전을 선택한다.
 - 기본 실행은 `v1.0`, `--use-velocity-reward-v2`를 추가하면 `v2.0`이다.
+
+### 기타 관련 변경
+
+- `robopianist/music/velocity_calibration.py`의 loudness helper reward는 `-(delta * delta)`에서 `-abs(delta)`로 변경되었다.
+- 이 변경은 loudness 차이에 대한 penalty 기울기를 더 크게 만들기 위한 조정이다.
+- 다만 현재 `v1.0`, `v2.0`의 main reward 경로는 `tolerance()` 기반 보상을 직접 사용하므로, 이 helper 변경은 현재 active reward의 핵심 계산 경로와는 분리되어 있다.
