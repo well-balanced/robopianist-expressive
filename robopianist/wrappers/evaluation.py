@@ -228,6 +228,16 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
         gt_loud = np.array([calib.loudness_db(int(v)) for v in gt_arr])
         loud_errors = robot_loud - gt_loud
         loud_corr = float(np.corrcoef(robot_loud, gt_loud)[0, 1]) if len(robot_loud) > 1 else float("nan")
+        gt_std = float(np.std(gt_arr))
+        dynamic_range_ratio = float(np.std(robot_arr)) / gt_std if gt_std > 0 else float("nan")
+
+        # Perceptual Dynamics Score (PDS): harmonic mean of correlation and bias components.
+        # s_corr = max(0, loud_corr); s_bias = exp(-|loud_bias| / 0.05)
+        # PDS = 2 / (1/s_corr + 1/s_bias), or 0 if either component is 0.
+        loud_bias = float(np.mean(loud_errors))
+        s_corr = max(0.0, loud_corr) if not np.isnan(loud_corr) else 0.0
+        s_bias = float(np.exp(-abs(loud_bias) / 0.05))
+        pds = float(2.0 / (1.0 / s_corr + 1.0 / s_bias)) if s_corr > 0 and s_bias > 0 else 0.0
 
         return {
             "mean_robot_midi_vel": float(np.mean(robot_arr)),
@@ -238,8 +248,10 @@ class MidiEvaluationWrapper(EnvironmentWrapper):
             "max_robot_onset_qvel": float(np.max(robot_qvel_arr)),
             "p90_robot_onset_qvel": float(np.percentile(robot_qvel_arr, 90)),
             "loudness_mae": float(np.mean(np.abs(loud_errors))),
-            "loudness_bias": float(np.mean(loud_errors)),
+            "loudness_bias": loud_bias,
             "loudness_correlation": loud_corr,
+            "dynamic_range_ratio": dynamic_range_ratio,
+            "perceptual_dynamics_score": pds,
         }
 
     def get_velocity_arrays(self) -> Tuple[np.ndarray, np.ndarray]:

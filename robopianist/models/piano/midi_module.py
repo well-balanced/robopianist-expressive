@@ -55,15 +55,22 @@ from robopianist.music import midi_file, midi_message
 # Step 2 — Hammer velocity from key-tip velocity (lever ratio)
 # ─────────────────────────────────────────────────────────────
 #   Inside the piano action the key acts as a lever driving the hammer via
-#   the wippen/repetition mechanism.  Askenfelt & Jansson (1990) observed
-#   that hammer travel is approximately 5× key travel; under rigid-body
-#   kinematics this displacement ratio equals the velocity ratio:
+#   the wippen/repetition mechanism.  Typical upright piano regulation values
+#   of ~10 mm key dip and ~44–45 mm hammer stroke (Reblitz, 1993, pp. 158–170)
+#   imply a displacement amplification of approximately 4.5–5.  Experimental
+#   studies of piano action kinematics further confirm this order-of-magnitude
+#   estimate (Askenfelt & Jansson, 1990, 1991).  Under rigid-body kinematics
+#   the displacement ratio equals the velocity ratio:
 #
 #     r_lever ≈ 5.0
 #
-#   Reference: Askenfelt, A. & Jansson, E. V. (1990). "From touch to string
-#   vibrations: The initial course of the piano tone." Journal of the
-#   Acoustical Society of America, 88(1), 52–63.
+#   References:
+#     Reblitz, A. A. (1993). Piano Servicing, Tuning, and Rebuilding (2nd ed.).
+#     Vestal Press, pp. 158–170.
+#
+#     Askenfelt, A. & Jansson, E. V. (1990). "From touch to string
+#     vibrations: The initial course of the piano tone." Journal of the
+#     Acoustical Society of America, 88(1), 52–63.
 #
 #   Therefore:
 #     v_hammer = v_tip × r_lever = qvel × 0.15 × 5.0 = qvel × 0.75
@@ -153,9 +160,9 @@ from robopianist.music import midi_file, midi_message
 # Single source of truth — import both constants wherever the conversion is
 # needed (piano_with_shadow_hands.py, wrappers/evaluation.py, etc.).
 # ---------------------------------------------------------------------------
-MAX_KEY_VEL: float = 8.0
-QVEL_MIN: float = 0.39       # minimum onset qvel to activate a key (rad/s)
-_MAX_KEY_VEL = MAX_KEY_VEL   # backward-compat alias (used in tests)
+MAX_KEY_VEL: float = 8.0   # 6.0 m/s / (0.15 m × 5.0) = 8.0 rad/s
+QVEL_MIN: float = 0.39    # minimum onset qvel to activate a key (rad/s)
+_MAX_KEY_VEL = MAX_KEY_VEL  # backward-compat alias (used in tests)
 
 
 class MidiModule:

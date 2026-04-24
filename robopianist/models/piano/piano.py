@@ -157,8 +157,9 @@ class Piano(composer.Entity):
         del random_state  # Unused.
         self._update_key_state(physics)
         self._update_key_color(physics)
+        key_velocities = None if self._fixed_output_velocity else self._key_velocities
         self._midi_module.after_substep(
-            physics, self._activation, self._sustain_activation, self._key_velocities
+            physics, self._activation, self._sustain_activation, key_velocities
         )
 
     # Methods.
@@ -172,6 +173,7 @@ class Piano(composer.Entity):
         self._key_velocities = np.zeros(piano_consts.NUM_KEYS, dtype=np.float64)
         self._onset_velocities = np.zeros(piano_consts.NUM_KEYS, dtype=np.float64)
         self._prev_activation_for_onset = np.zeros(piano_consts.NUM_KEYS, dtype=bool)
+        self._fixed_output_velocity: bool = False
 
     def is_key_black(self, key_id: int) -> bool:
         """Returns True if the piano key id corresponds to a black key."""

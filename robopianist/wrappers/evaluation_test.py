@@ -174,6 +174,35 @@ class MidiEvaluationWrapperTest(absltest.TestCase):
         expected_error = abs(expected_robot_midi_vel - gt_midi_vel)
         self.assertAlmostEqual(metrics["velocity_mae"], float(expected_error))
         self.assertAlmostEqual(metrics["velocity_bias"], float(expected_robot_midi_vel - gt_midi_vel))
+        self.assertIn("perceptual_dynamics_score", metrics)
+        # With a single matched onset, loud_corr is nan → s_corr=0 → PDS=0.
+        self.assertEqual(metrics["perceptual_dynamics_score"], 0.0)
+
+    def test_pds_is_present_and_bounded(self) -> None:
+        """PDS is present in velocity metrics and lies in [0, 1]."""
+        key_id = 40
+        onset_qvel = 2.0
+        gt_midi_vel = 64
+        metadata = ScoreKeyMetadata(
+            score_key_active=True,
+            gt_is_true_onset=True,
+            score_sustain=False,
+            gt_active_midi_vel=gt_midi_vel,
+            gt_true_onset_midi_vel=gt_midi_vel,
+        )
+        env = MidiEvaluationWrapper(
+            _FakeEnv(
+                _FakeTask(key_id, metadata, score_velocity=gt_midi_vel, onset_qvel=onset_qvel)
+            )
+        )
+        env.reset()
+        env.step(np.zeros((1,), dtype=np.float32))
+
+        metrics = env.get_velocity_metrics()
+        self.assertIn("perceptual_dynamics_score", metrics)
+        pds = metrics["perceptual_dynamics_score"]
+        # Single onset → loud_corr is nan → s_corr=0 → PDS=0.
+        self.assertEqual(pds, 0.0)
 
 
 if __name__ == "__main__":

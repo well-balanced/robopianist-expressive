@@ -97,7 +97,7 @@ class PianoTask(PianoOnlyTask):
         self,
         arena: composer_utils.Arena,
         gravity_compensation: bool = False,
-        change_color_on_activation: bool = False,
+        change_color_on_activation: bool = True,
         primitive_fingertip_collisions: bool = False,
         reduced_action_space: bool = False,
         attachment_yaw: float = _ATTACHMENT_YAW,
