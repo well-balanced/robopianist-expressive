@@ -30,6 +30,7 @@ import robopianist.models.hands.shadow_hand_constants as hand_consts
 from robopianist.models.arenas import stage
 from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL, QVEL_MIN as _QVEL_MIN
 from robopianist.music import midi_file
+from robopianist.music.style_transform import apply_style
 from robopianist.suite import composite_reward
 from robopianist.suite.tasks import base
 
@@ -90,6 +91,8 @@ class PianoWithShadowHands(base.PianoTask):
         disable_velocity_reward: bool = False,
         velocity_reward_version: str = "v1.0",
         use_velocity_reward_v2: bool = False,
+        style_velocity_scale: float = 1.0,
+        style_velocity_scale_choices: Optional[Sequence[float]] = None,
         n_steps_velocity_lookahead: int = 3,
         compact_residual_obs: bool = False,
         **kwargs,
@@ -125,6 +128,12 @@ class PianoWithShadowHands(base.PianoTask):
                 current v1 reward.
             use_velocity_reward_v2: If True, forces the current v2 reward path.
                 Kept for backward compatibility with older launch commands.
+            style_velocity_scale: Fixed velocity scale applied to the score when
+                no per-episode sampling is requested.
+            style_velocity_scale_choices: Optional list/tuple of velocity scales to
+                sample from at the beginning of each episode. This is intended for
+                mixed-scale training where one policy should see multiple target
+                velocity distributions.
             augmentations: A list of `Variation` objects that will be applied to the
                 MIDI file at the beginning of each episode. If None, no augmentations
                 will be applied.
@@ -142,8 +151,26 @@ class PianoWithShadowHands(base.PianoTask):
 
         if trim_silence:
             midi = midi.trim_silence()
-        self._midi = midi
         self._initial_midi = midi
+        self._style_velocity_scale = float(style_velocity_scale)
+        if self._style_velocity_scale <= 0.0:
+            raise ValueError("style_velocity_scale must be positive.")
+        if style_velocity_scale_choices is None:
+            self._style_velocity_scale_choices = ()
+        else:
+            self._style_velocity_scale_choices = tuple(
+                float(scale) for scale in style_velocity_scale_choices
+            )
+            if not self._style_velocity_scale_choices:
+                raise ValueError("style_velocity_scale_choices cannot be empty.")
+            if any(scale <= 0.0 for scale in self._style_velocity_scale_choices):
+                raise ValueError(
+                    "All style_velocity_scale_choices entries must be positive."
+                )
+        self._current_style_velocity_scale = self._style_velocity_scale
+        self._midi = self._style_midi(
+            midi=self._initial_midi, velocity_scale=self._current_style_velocity_scale
+        )
         self._n_steps_lookahead = n_steps_lookahead
         if n_seconds_lookahead is not None:
             self._n_steps_lookahead = int(
@@ -218,13 +245,43 @@ class PianoWithShadowHands(base.PianoTask):
         self._prev_velocity_reward_gt_mean: Optional[float] = None
         self._recent_velocity_reward_errors: List[float] = []
 
+    @property
+    def current_style_velocity_scale(self) -> float:
+        return self._current_style_velocity_scale
+
+    @property
+    def style_velocity_scale_choices(self) -> Tuple[float, ...]:
+        return self._style_velocity_scale_choices
+
+    def _style_midi(
+        self, midi: midi_file.MidiFile, velocity_scale: float
+    ) -> midi_file.MidiFile:
+        if abs(velocity_scale - 1.0) <= 1e-9:
+            return midi
+        return apply_style(midi, velocity_scale=velocity_scale)
+
+    def _sample_style_velocity_scale(
+        self, random_state: np.random.RandomState
+    ) -> float:
+        if self._style_velocity_scale_choices:
+            return float(random_state.choice(self._style_velocity_scale_choices))
+        return self._style_velocity_scale
+
     def _maybe_change_midi(self, random_state: np.random.RandomState) -> None:
-        if self._augmentations is not None:
-            midi = self._initial_midi
-            for var in self._augmentations:
-                midi = var(initial_value=midi, random_state=random_state)
-            self._midi = midi
-            self._reset_trajectory()
+        if self._augmentations is None and not self._style_velocity_scale_choices:
+            return
+
+        midi = self._initial_midi
+        for var in self._augmentations or ():
+            midi = var(initial_value=midi, random_state=random_state)
+
+        self._current_style_velocity_scale = self._sample_style_velocity_scale(
+            random_state
+        )
+        self._midi = self._style_midi(
+            midi=midi, velocity_scale=self._current_style_velocity_scale
+        )
+        self._reset_trajectory()
 
     def _reset_trajectory(self) -> None:
         note_traj = midi_file.NoteTrajectory.from_midi(

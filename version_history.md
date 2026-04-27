@@ -86,3 +86,27 @@
 - `robopianist/music/velocity_calibration.py`의 loudness helper reward는 `-(delta * delta)`에서 `-abs(delta)`로 변경되었다.
 - 이 변경은 loudness 차이에 대한 penalty 기울기를 더 크게 만들기 위한 조정이다.
 - 다만 현재 `v1.0`, `v2.0`의 main reward 경로는 `tolerance()` 기반 보상을 직접 사용하므로, 이 helper 변경은 현재 active reward의 핵심 계산 경로와는 분리되어 있다.
+
+## 2026-04-26
+
+### mixed-scale training v1.0
+
+- 한 policy가 여러 target velocity distribution을 같이 보도록, per-episode velocity scale sampling 경로를 추가했다.
+- 새 학습 인자:
+  - `suite.load(..., train_style_velocity_scales=(0.8, 1.0, 1.2))`
+  - `train.py --train-style-velocity-scales 0.8 1.0 1.2`
+- 동작 흐름:
+  - train env는 raw MIDI를 task로 넘긴다.
+  - `PianoWithShadowHands.initialize_episode()`에서 episode 시작마다 scale 하나를 샘플링한다.
+  - 샘플링된 scale로 `apply_style(..., velocity_scale=sampled_scale)`를 다시 적용한다.
+  - 그 뒤 `_reset_trajectory()`를 다시 호출해서 score note / sustain / velocity target map을 현재 scale 기준으로 재생성한다.
+- 목적:
+  - `0.8 / 1.0 / 1.2`를 모두 본 단일 policy를 학습시켜서, `0.9 / 1.1` 같은 interpolation scale generalization을 평가하기 위해서다.
+  - 기존의 순차 fine-tuning (`1.0 -> 0.8 -> 1.2`) 대신, 한 replay buffer 안에 여러 scale transition을 섞어 넣는 학습을 지원하기 위해서다.
+- train / eval 분리:
+  - train env만 `train_style_velocity_scales`를 사용한다.
+  - eval env는 기존처럼 고정 `style_velocity_scale` 하나만 사용한다.
+  - 따라서 학습은 mixed-scale로 하고, 평가는 `0.8 / 0.9 / 1.0 / 1.1 / 1.2`를 각각 따로 돌릴 수 있다.
+- 현재 제한:
+  - mixed-scale path는 지금 `velocity_scale` randomization만 지원한다.
+  - `velocity_contrast`, `melody_gain`, `dynamic_trend`와의 동시 mixed sampling은 아직 지원하지 않는다.

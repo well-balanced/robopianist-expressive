@@ -4,6 +4,7 @@ This file provides guidance to Codex and other repository-aware coding agents wh
 
 # Rules
 - 실행하거나 종료하거나 re-run 할 때는 반드시 지금 작업하려는 내용과 의도를 말하고 내게 approve 받고 진행할 것
+- `wandb` 로그 조회, `rg`, `git diff`, 설정/결과 확인처럼 파일이나 실험 상태를 바꾸지 않는 읽기 전용 분석은 사전 승인 없이 진행해도 됨
 - 모든 구현에 대해서는 "반드시" 어떤 것들이 어떤 흐름으로 되었는지 자세하게 설명할 것. 코드랑 함께
 - 코드는 항상 human readable하게
 - 구조 자체를 일부러 더 복잡하게 만들지마
