@@ -4,6 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # Rules
 - you MUST calcel or run or re-run after my approve
+- robopianist-expressive/version_history.md랑 robopianist-rl/version_history.md 항상 확인할 것. 코드 베이스에 큰 변화가 있다면 여기에 버저닝하고 업데이트 할 것
 
 ## Versioning
 
@@ -190,3 +191,4 @@ tolerance(
     sigmoid="gaussian",    # shape of decay
     value_at_margin=0.1,   # reward value at the edge of margin
 )
+

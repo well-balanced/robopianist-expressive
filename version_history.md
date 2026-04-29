@@ -110,3 +110,68 @@
 - 현재 제한:
   - mixed-scale path는 지금 `velocity_scale` randomization만 지원한다.
   - `velocity_contrast`, `melody_gain`, `dynamic_trend`와의 동시 mixed sampling은 아직 지원하지 않는다.
+
+## 2026-04-28
+
+### OOD interpolation eval v1.0
+
+- mixed-scale training (`{0.8, 1.0, 1.2}`)으로 학습한 policy (`04271311_tw_residual_full_a0.1_v1.0_coef0.5_allscale_from2M_2M`)에 대해 dense interpolation eval을 수행했다.
+- 평가 설정:
+  - scale 범위: `0.70 ~ 1.30`, 간격 `0.05`, 총 13개 scale
+  - 에피소드 수: scale당 100 episodes
+  - 총 environment steps: 약 205,400 steps (episode length 158 × 1,300 episodes)
+  - 소요 시간: 약 44분 (GPU 1개, RTX 5090)
+  - 결과 저장: `robopianist-rl/ood_interpolation_results.csv`, wandb group `ood-interpolation-dense-v1`
+- 주요 평가 지표:
+  - `eval/return`, `eval/f1`, `eval/precision`, `eval/recall`
+  - `eval/velocity_mae`, `eval/velocity_bias`
+  - `eval/loudness_correlation`, `eval/perceptual_dynamics_score`
+  - `eval/mean_robot_midi_vel`
+- 결과 요약:
+  - **scale 0.70**: `velocity_mae=11.1`, `loudness_correlation=0.27`, `perceptual_dynamics_score=0.24` — 성능이 크게 떨어짐. 학습 범위 밖의 OOD 구간임이 명확함.
+  - **scale 0.75**: `velocity_mae=3.8`, `loudness_correlation=0.76`, `perceptual_dynamics_score=0.86` — 급격히 회복. 경계 구간.
+  - **scale 0.80 ~ 1.20** (학습 범위 내): 전반적으로 안정적. `velocity_mae` 2.5~5.4 수준.
+  - **scale 0.90 ~ 1.00**: `velocity_mae` 가장 낮고 `loudness_correlation` 0.90 이상 — 가장 성능이 좋은 구간.
+  - **scale 1.05 ~ 1.20**: `perceptual_dynamics_score`가 학습 범위 내임에도 0.58~0.80으로 변동. 특히 `1.05, 1.10`에서 `loudness_correlation`이 하락하는 경향.
+  - **scale 1.25 ~ 1.30**: `velocity_mae` 6.2~10.2, `perceptual_dynamics_score` 0.26~0.52 — 다시 급락. OOD 구간.
+- 결론:
+  - 학습 scale `{0.8, 1.0, 1.2}` 기준으로 **0.75~1.20** 구간은 어느 정도 generalization이 된다.
+  - **0.90~1.10**이 interpolation이 가장 잘 되는 구간이며, OOD claim의 경계로 제시할 수 있다.
+  - **0.70 이하, 1.25 이상**은 명확한 OOD 성능 저하가 관찰됨.
+- 향후 과제:
+  - 왜 굳이 sparse하게 학습하고 interpolation에 의존하느냐는 리뷰어 질문에 대한 답변 확보 필요.
+  - 다음 실험: train scale 개수를 늘렸을 때 학습 자체가 힘들어지는지 정량적으로 확인.
+
+## 2026-04-29
+
+### scale complexity 실험 계획 v1.0
+
+- **목적**: "왜 모든 scale을 다 샘플링하지 않고 sparse하게 훈련하느냐"는 리뷰어 질문에 대한 실험적 근거를 확보한다.
+- **가설**: train에 사용하는 velocity scale 조합의 수가 많아질수록 학습이 불안정해지고, 수렴이 느려지며, seen scale에서의 성능도 저하된다.
+- **실험 매트릭스**:
+
+  | 조건 | train scales | seed 수 | 총 runs |
+  |------|-------------|---------|--------|
+  | scale1 | `{1.0}` | 3 | 3 |
+  | scale2 | `{0.8, 1.2}` | 3 | 3 |
+  | scale3 | `{0.8, 1.0, 1.2}` | 3 | 3 |
+  | scale5 | `{0.8, 0.9, 1.0, 1.1, 1.2}` | 3 | 3 |
+  | scale13 | `{0.70, 0.75, ..., 1.30}` (0.05 간격, 13개) | 3 | 3 |
+
+  - 총 15 runs, 서버 2대 (GPU 8개) 기준 2배치로 완료 예상.
+  - 각 run: 동일한 base checkpoint (`04241633_tw_v1.0_coef0.5_2M/checkpoint_2000000.flax`), 동일한 총 steps (2M), 동일한 residual 설정 (`fingers_only, alpha=0.1`).
+  - seed: `0, 1, 2` 사용. 기존 `04271311` (scale3, seed=42)은 별도 참조용이며, 이 실험에서는 seed 0/1/2로 새로 돌린다.
+
+- **측정 지표**:
+  - 학습 안정성: training return curve의 분산 및 수렴 속도 (wandb training curve).
+  - seen scale 성능: 각 조건에서 train에 포함된 scale들의 eval return / F1 / velocity_mae 평균.
+  - unseen scale generalization: 각 조건 학습 후 `0.9 / 1.1` eval 성능 (별도 OOD eval 스크립트 재사용).
+
+- **예상 결과**:
+  - scale 수 증가 → training return 분산 증가, 수렴 속도 저하, seen scale 평균 성능 하락.
+  - 이를 통해 "현실적으로 sparse training이 필요하다"는 주장을 실험으로 뒷받침한다.
+
+- **리스크**:
+  - scale 수가 많아져도 학습이 잘 되면 당위성이 약해짐. 이 경우 기여점을 "더 적은 훈련 조합으로 더 넓은 generalization"으로 재정의해야 할 수 있음.
+
+- **실험 스크립트 위치**: `robopianist-rl/run_scale_complexity_exp.sh` (작성 예정).

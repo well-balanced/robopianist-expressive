@@ -8,6 +8,7 @@ This file provides guidance to Codex and other repository-aware coding agents wh
 - 모든 구현에 대해서는 "반드시" 어떤 것들이 어떤 흐름으로 되었는지 자세하게 설명할 것. 코드랑 함께
 - 코드는 항상 human readable하게
 - 구조 자체를 일부러 더 복잡하게 만들지마
+- robopianist-expressive/version_history.md랑 robopianist-rl/version_history.md 항상 확인할 것. 코드 베이스에 큰 변화가 있다면 여기에 버저닝하고 업데이트 할 것
 
 ## Versioning
 
