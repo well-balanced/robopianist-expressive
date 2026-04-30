@@ -259,6 +259,9 @@ class PianoWithShadowHands(base.PianoTask):
         self._velocity_goal_state: np.ndarray = np.zeros(
             (self._n_steps_velocity_lookahead + 1, self.piano.n_keys), dtype=np.float64
         )
+        self._true_onset_goal_state: np.ndarray = np.zeros(
+            (self._n_steps_velocity_lookahead + 1, self.piano.n_keys), dtype=np.float64
+        )
         # v2 compares the current matched-onset mean against recent matched-onset
         # history, so these episode-local accumulators reset every episode.
         self._prev_velocity_reward_robot_mean: Optional[float] = None
@@ -893,25 +896,18 @@ class PianoWithShadowHands(base.PianoTask):
             for note in self._notes[t]:
                 self._velocity_goal_state[i, note.key] = note.velocity / 127.0
 
-    def _get_velocity_scaled_goal_state(self) -> np.ndarray:
-        """Goal state with velocity scaling instead of binary 1.0.
-
-        Same shape as the regular goal state: (n_steps_lookahead+1, n_keys+1).
-        Where the regular goal has 1.0 for a pressed key, this has velocity/127.
-        The sustain dimension (last) stays binary, as sustain has no velocity.
-        Returns zeros if the episode is ending.
-        """
-        n = self._n_steps_lookahead + 1
-        result = np.zeros((n, self.piano.n_keys + 1), dtype=np.float64)
+    def _update_true_onset_goal_state(self) -> None:
         if self._t_idx == len(self._notes):
-            return result
+            return
+        self._true_onset_goal_state = np.zeros(
+            (self._n_steps_velocity_lookahead + 1, self.piano.n_keys),
+            dtype=np.float64,
+        )
         t_start = self._t_idx
-        t_end = min(t_start + n, len(self._notes))
+        t_end = min(t_start + self._n_steps_velocity_lookahead + 1, len(self._notes))
         for i, t in enumerate(range(t_start, t_end)):
-            for note in self._notes[t]:
-                result[i, note.key] = note.velocity / 127.0
-            result[i, -1] = self._sustains[t]
-        return result
+            for key in self._score_true_onset_velocity_map(t):
+                self._true_onset_goal_state[i, key] = 1.0
 
     def _update_fingering_state(self) -> None:
         if self._t_idx == len(self._notes):
@@ -974,16 +970,35 @@ class PianoWithShadowHands(base.PianoTask):
         self.piano.observables.state.enabled = True
         self.piano.observables.sustain_state.enabled = True
 
-        # Goal state: binary 1.0 entries replaced by velocity/127 (scaled_goal).
-        # _goal_state stays binary for reward computation.
+        # Goal state: original RoboPianist binary support target.
         def _get_goal_state(physics) -> np.ndarray:
             del physics  # Unused.
             self._update_goal_state()
-            return self._get_velocity_scaled_goal_state().ravel()
+            return self._goal_state.ravel()
 
         goal_observable = observable.Generic(_get_goal_state)
         goal_observable.enabled = True
         self._task_observables = {"goal": goal_observable}
+
+        # Velocity target: short-horizon per-key target velocity.
+        def _get_goal_velocity_state(physics) -> np.ndarray:
+            del physics  # Unused.
+            self._update_velocity_goal_state()
+            return self._velocity_goal_state.ravel()
+
+        goal_velocity_observable = observable.Generic(_get_goal_velocity_state)
+        goal_velocity_observable.enabled = True
+        self._task_observables["goal_velocity"] = goal_velocity_observable
+
+        # True-onset target: short-horizon binary onset mask.
+        def _get_goal_true_onset_state(physics) -> np.ndarray:
+            del physics  # Unused.
+            self._update_true_onset_goal_state()
+            return self._true_onset_goal_state.ravel()
+
+        goal_true_onset_observable = observable.Generic(_get_goal_true_onset_state)
+        goal_true_onset_observable.enabled = True
+        self._task_observables["goal_true_onset"] = goal_true_onset_observable
 
         # This adds fingering information for the current timestep.
         def _get_fingering_state(physics) -> np.ndarray:

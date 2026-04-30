@@ -145,6 +145,7 @@ def _get_env(
     velocity_onset_window_steps: int = 0,
     style_velocity_scale_choices: Optional[Sequence[float]] = None,
     onset_accuracy_reward_coef: float = 0.0,
+    n_steps_velocity_lookahead: int = 3,
 ) -> composer.Environment:
     task_kwargs = dict(
         midi=midi or _get_test_midi(dt=control_timestep),
@@ -157,6 +158,7 @@ def _get_env(
         style_velocity_scale=style_velocity_scale,
         style_velocity_scale_choices=style_velocity_scale_choices,
         onset_accuracy_reward_coef=onset_accuracy_reward_coef,
+        n_steps_velocity_lookahead=n_steps_velocity_lookahead,
     )
     if velocity_onset_window_steps != 0:
         task_kwargs["velocity_onset_window_steps"] = velocity_onset_window_steps
@@ -176,6 +178,8 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
 
         # Goal observables.
         self.assertIn("goal", timestep.observation)
+        self.assertIn("goal_velocity", timestep.observation)
+        self.assertIn("goal_true_onset", timestep.observation)
         if disable_fingering_reward:
             self.assertNotIn("fingering", timestep.observation)
         else:
@@ -264,28 +268,99 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
             t_end = min(i + n_steps_lookahead + 1, len(notes))
             for j, t in enumerate(range(t_start, t_end)):
                 for note in notes[t]:
-                    expected_goal[j, note.key] = note.velocity / 127.0
+                    expected_goal[j, note.key] = 1.0
                 expected_goal[j, -1] = sustains[t]
 
             actual_goal = timestep.observation["goal"]
             np.testing.assert_array_equal(actual_goal, expected_goal.ravel())
 
             # Check that the 0th goal is always the goal at the current timestep.
-            expected_current = np.zeros((env.task.piano.n_keys + 1,))
             expected_reward_goal = np.zeros((env.task.piano.n_keys + 1,))
             for note in notes[i]:
-                expected_current[note.key] = note.velocity / 127.0
                 expected_reward_goal[note.key] = 1.0
-            expected_current[-1] = sustains[i]
             expected_reward_goal[-1] = sustains[i]
             actual_current = timestep.observation["goal"][0 : env.task.piano.n_keys + 1]
-            np.testing.assert_array_equal(actual_current, expected_current)
+            np.testing.assert_array_equal(actual_current, expected_reward_goal)
 
             timestep = env.step(zero_action)
 
-            # The observable exposes velocity-scaled goals, but the reward cache keeps
-            # the binary press target for the current timestep.
+            # The observable and reward cache now both keep the binary press target.
             np.testing.assert_array_equal(expected_reward_goal, env.task._goal_current)
+
+    @parameterized.parameters(0, 1, 3)
+    def test_goal_velocity_observable_lookahead(self, n_steps_velocity_lookahead: int) -> None:
+        env = _get_env(
+            control_timestep=0.01,
+            midi=_get_test_midi(dt=0.01),
+            n_steps_velocity_lookahead=n_steps_velocity_lookahead,
+        )
+        action_spec = env.action_spec()
+        zero_action = np.zeros(action_spec.shape)
+        timestep = env.reset()
+
+        midi = _get_test_midi(dt=0.01)
+        note_traj = midi_file.NoteTrajectory.from_midi(
+            midi, dt=env.task.control_timestep
+        )
+        notes = note_traj.notes
+
+        for i in range(len(notes)):
+            expected_goal_velocity = np.zeros(
+                (n_steps_velocity_lookahead + 1, env.task.piano.n_keys)
+            )
+            t_start = i
+            t_end = min(i + n_steps_velocity_lookahead + 1, len(notes))
+            for j, t in enumerate(range(t_start, t_end)):
+                for note in notes[t]:
+                    expected_goal_velocity[j, note.key] = note.velocity / 127.0
+
+            actual_goal_velocity = timestep.observation["goal_velocity"]
+            np.testing.assert_array_equal(
+                actual_goal_velocity, expected_goal_velocity.ravel()
+            )
+            timestep = env.step(zero_action)
+
+    @parameterized.parameters(0, 1, 3)
+    def test_goal_true_onset_observable_lookahead(
+        self, n_steps_velocity_lookahead: int
+    ) -> None:
+        env = _get_env(
+            control_timestep=0.01,
+            midi=_get_test_midi(dt=0.01),
+            n_steps_velocity_lookahead=n_steps_velocity_lookahead,
+        )
+        action_spec = env.action_spec()
+        zero_action = np.zeros(action_spec.shape)
+        timestep = env.reset()
+
+        midi = _get_test_midi(dt=0.01)
+        note_traj = midi_file.NoteTrajectory.from_midi(
+            midi, dt=env.task.control_timestep
+        )
+        notes = note_traj.notes
+        prev_active_keys = set()
+
+        for i in range(len(notes)):
+            expected_goal_true_onset = np.zeros(
+                (n_steps_velocity_lookahead + 1, env.task.piano.n_keys)
+            )
+            local_prev_active_keys = prev_active_keys.copy()
+            t_start = i
+            t_end = min(i + n_steps_velocity_lookahead + 1, len(notes))
+            for j, t in enumerate(range(t_start, t_end)):
+                active_keys = {note.key for note in notes[t]}
+                true_onset_keys = active_keys - local_prev_active_keys
+                for key in true_onset_keys:
+                    expected_goal_true_onset[j, key] = 1.0
+                local_prev_active_keys = active_keys
+
+            actual_goal_true_onset = timestep.observation["goal_true_onset"]
+            np.testing.assert_array_equal(
+                actual_goal_true_onset, expected_goal_true_onset.ravel()
+            )
+
+            prev_active_keys = {note.key for note in notes[i]}
+            timestep = env.step(zero_action)
 
     def test_fingering_observable(self) -> None:
         env = _get_env(control_timestep=0.01)
@@ -336,7 +411,10 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
             seen_scales.add(scale)
             self.assertIn(scale, (0.5, 1.5))
             expected_velocity = round(80 * scale) / 127.0
-            self.assertAlmostEqual(timestep.observation["goal"][key_id], expected_velocity)
+            self.assertEqual(timestep.observation["goal"][key_id], 1.0)
+            self.assertAlmostEqual(
+                timestep.observation["goal_velocity"][key_id], expected_velocity
+            )
 
         self.assertEqual(seen_scales, {0.5, 1.5})
 
@@ -351,7 +429,10 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
         timestep = env.reset()
         self.assertAlmostEqual(env.task.current_style_velocity_scale, 0.75)
         expected_velocity = round(80 * 0.75) / 127.0
-        self.assertAlmostEqual(timestep.observation["goal"][key_id], expected_velocity)
+        self.assertEqual(timestep.observation["goal"][key_id], 1.0)
+        self.assertAlmostEqual(
+            timestep.observation["goal_velocity"][key_id], expected_velocity
+        )
 
     def test_style_velocity_scale_choices_are_exposed(self) -> None:
         env = _get_env(style_velocity_scale_choices=(0.8, 1.0, 1.2))

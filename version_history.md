@@ -201,3 +201,54 @@
   - 이렇게 해서 single-note step과 chord step 사이에서 reward scale이 과하게 흔들리지 않게 했다.
 - 시작부 grace:
   - `initial_buffer_time` 때문에 episode 시작 직후에는 score상 이미 active인 음이 있을 수 있어서, 첫 2 step은 `hold_rehit` penalty를 주지 않는다.
+
+### from-scratch observation redesign 계획 v1.0
+
+- **배경**:
+  - 현재 실험 코드에서는 기존 binary `goal`을 velocity-scaled `goal`로 바꿔 사용하고 있다.
+  - 이 방식은 `어떤 키가 필요한가`와 `얼마나 세게 쳐야 하는가`를 한 채널에 섞는다는 문제가 있다.
+  - from-scratch 실험에서는 원래 RoboPianist observation 철학으로 돌아가되, velocity / onset 정보를 별도 observable로 분리한다.
+
+- **출발점**:
+  - 기준 observation은 `main` 브랜치의 원래 RoboPianist 설정이다.
+  - 원래 코어는 `binary goal + piano state + sustain state + joints_pos (+ fingering)`이다.
+
+- **v1 base observation**:
+  - `goal_active`: lookahead `10`
+  - `goal_velocity`: lookahead `3`
+  - `piano_state`
+  - `sustain_state`
+  - `joints_pos`
+  - `joints_vel`
+  - `fingering` optional
+
+- **v1 residual observation**:
+  - base observation이 보는 정보 전부
+  - `goal_true_onset`: lookahead `3`
+  - `base_action`
+
+- **핵심 원칙**:
+  - `goal_active`와 `goal_velocity`를 분리한다.
+  - active key 정보는 long-horizon planning 신호로 유지한다.
+  - velocity / onset 정보는 short-horizon (`3`) 신호로 제한한다.
+  - `goal_true_onset`은 우선 residual 전용 신호로 둔다.
+
+- **기존 RoboPianist 대비 diff**:
+  - base: `+ joints_vel`, `+ goal_velocity(3)`, `= binary goal 유지`
+  - residual: `+ joints_vel`, `+ goal_velocity(3)`, `+ goal_true_onset(3)`, `+ base_action`
+
+- **보류 사항**:
+  - base policy에 `goal_true_onset` 넣기
+  - actor/critic privileged split
+  - critic decomposition (`B`, `B+C`)
+
+- **구현 방향**:
+  - `goal_active` observable 복구
+  - `goal_velocity` observable 추가
+  - `goal_true_onset` observable 추가
+  - base obs / residual obs slicing 구조를 새 브랜치에서 from-scratch로 연결
+
+- **2026-04-30 / 구현 상태 업데이트**:
+  - 기존 velocity-scaled `goal`을 binary support `goal`로 되돌렸다.
+  - `goal_velocity`와 `goal_true_onset` observable을 별도 채널로 추가했다.
+  - 현재 env는 from-scratch observation v1에 필요한 raw signal을 모두 제공하며, `robopianist-rl` 쪽 explicit observation wrapper가 이를 base/residual/critic 입력으로 재조립한다.
