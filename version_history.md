@@ -175,3 +175,29 @@
   - scale 수가 많아져도 학습이 잘 되면 당위성이 약해짐. 이 경우 기여점을 "더 적은 훈련 조합으로 더 넓은 generalization"으로 재정의해야 할 수 있음.
 
 - **실험 스크립트 위치**: `robopianist-rl/run_scale_complexity_exp.sh` (작성 예정).
+
+## 2026-04-30
+
+### onset accuracy reward v1.0
+
+- `key_press_reward`는 그대로 두고, onset event correctness만 따로 보는 `onset_accuracy_reward`를 새로 추가했다.
+- 기본값은 `onset_accuracy_reward_coef = 0.0`이라서, 기존 실험은 그대로 유지된다.
+- 목적:
+  - frame-wise key state가 맞더라도, 실제로는 true onset을 놓치거나 hold 중 retrigger를 만드는 문제를 직접 보상에 반영하기 위해서다.
+  - 기존 `velocity_reward_v2` 안에 섞여 있던 onset semantics를 velocity와 분리해서, note correctness 쪽 책임으로 옮기기 위해서다.
+- 계산 흐름:
+  - robot 새 onset은 `activation & ~prev_activation`로 잡는다.
+  - score true onset map과 비교해서 `hit_rate`, `miss_rate`를 계산한다.
+  - score는 이미 hold만 원하지만 robot이 다시 onset한 경우를 `hold_rehit_rate`로 계산한다.
+  - score가 아예 active도 원하지 않는 key에 onset한 경우를 `offscore_fp_rate`로 계산한다.
+  - 최종 reward는 아래 선형 결합이다.
+    - `+0.30 * hit_rate`
+    - `-0.10 * miss_rate`
+    - `-0.05 * offscore_fp_rate`
+    - `-0.20 * hold_rehit_rate`
+- 정규화 방식:
+  - `hit_rate`, `miss_rate`는 GT true onset 개수로 나눈다.
+  - `offscore_fp_rate`, `hold_rehit_rate`는 robot onset 개수로 나눈다.
+  - 이렇게 해서 single-note step과 chord step 사이에서 reward scale이 과하게 흔들리지 않게 했다.
+- 시작부 grace:
+  - `initial_buffer_time` 때문에 episode 시작 직후에는 score상 이미 active인 음이 있을 수 있어서, 첫 2 step은 `hold_rehit` penalty를 주지 않는다.

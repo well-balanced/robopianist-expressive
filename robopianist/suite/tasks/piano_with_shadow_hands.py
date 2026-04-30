@@ -44,6 +44,14 @@ _ENERGY_PENALTY_COEF = 5e-3
 # Key press reward coefficient.
 _KEY_PRESS_REWARD_COEF = 1.0
 
+# Onset accuracy reward coefficient.
+_ONSET_ACCURACY_REWARD_COEF = 0.0
+_ONSET_ACCURACY_HOLD_REHIT_GRACE_STEPS = 2
+_ONSET_ACCURACY_HIT_BONUS = 0.30
+_ONSET_ACCURACY_MISS_PENALTY = 0.10
+_ONSET_ACCURACY_OFFSCORE_FP_PENALTY = 0.05
+_ONSET_ACCURACY_HOLD_REHIT_PENALTY = 0.20
+
 # Velocity reward coefficient.
 _VELOCITY_REWARD_COEF = 1.0
 _VELOCITY_V2_HOLD_PENALTY_GRACE_STEPS = 2
@@ -86,6 +94,7 @@ class PianoWithShadowHands(base.PianoTask):
         augmentations: Optional[Sequence[base_variation.Variation]] = None,
         energy_penalty_coef: float = _ENERGY_PENALTY_COEF,
         key_press_reward_coef: float = _KEY_PRESS_REWARD_COEF,
+        onset_accuracy_reward_coef: float = _ONSET_ACCURACY_REWARD_COEF,
         randomize_hand_positions: bool = False,
         velocity_reward_coef: float = _VELOCITY_REWARD_COEF,
         disable_velocity_reward: bool = False,
@@ -140,6 +149,10 @@ class PianoWithShadowHands(base.PianoTask):
             energy_penalty_coef: Coefficient for the energy penalty.
             key_press_reward_coef: Coefficient for the key press reward. Scales the
                 key press reward term relative to other reward components.
+            onset_accuracy_reward_coef: Coefficient for the onset-accuracy reward.
+                This event-level reward is separate from the dense key-state reward:
+                it rewards correct true onsets and penalizes missed onsets,
+                off-score onsets, and hold retriggers. Set to 0.0 to disable it.
             velocity_reward_coef: Coefficient for the velocity reward. Scales the
                 velocity reward term relative to other reward components.
             randomize_hand_positions: If True, randomizes the initial position of the
@@ -148,6 +161,8 @@ class PianoWithShadowHands(base.PianoTask):
                 velocity goal observable. Independent of n_steps_lookahead.
         """
         super().__init__(arena=stage.Stage(), **kwargs)
+        if onset_accuracy_reward_coef < 0.0:
+            raise ValueError("onset_accuracy_reward_coef must be non-negative.")
 
         if trim_silence:
             midi = midi.trim_silence()
@@ -193,6 +208,7 @@ class PianoWithShadowHands(base.PianoTask):
         self._augmentations = augmentations
         self._energy_penalty_coef = energy_penalty_coef
         self._key_press_reward_coef = key_press_reward_coef
+        self._onset_accuracy_reward_coef = onset_accuracy_reward_coef
         self._compact_residual_obs = compact_residual_obs
         self._randomize_hand_positions = randomize_hand_positions
         self._score_active_velocity_maps: List[Dict[int, int]] = []
@@ -213,6 +229,10 @@ class PianoWithShadowHands(base.PianoTask):
             sustain_reward=self._compute_sustain_reward,
             energy_reward=self._compute_energy_reward,
         )
+        if self._onset_accuracy_reward_coef > 0.0:
+            self._reward_fn.add(
+                "onset_accuracy_reward", self._compute_onset_accuracy_reward
+            )
         if not self._disable_fingering_reward:
             self._reward_fn.add("fingering_reward", self._compute_fingering_reward)
         else:
@@ -485,6 +505,77 @@ class PianoWithShadowHands(base.PianoTask):
         off = np.flatnonzero(1 - self._goal_current[:-1])
         rew += 0.5 * (1 - float(self.piano.activation[off].any()))
         return self._key_press_reward_coef * rew
+
+    def _get_onset_accuracy_rates(
+        self, new_onsets: np.ndarray, t_idx: int
+    ) -> Tuple[float, float, float, float]:
+        """Returns normalized onset-accuracy event rates for one timestep.
+
+        The four returned values are:
+        1. hit_rate: GT true onsets that the robot also created this step.
+        2. miss_rate: GT true onsets that the robot failed to create this step.
+        3. offscore_fp_rate: robot onsets on keys the score does not want active.
+        4. hold_rehit_rate: robot onsets on keys the score wanted to keep held.
+
+        We normalize hit/miss by the number of GT true onsets, and normalize
+        off-score / hold-rehit terms by the number of robot onsets. This keeps
+        the reward scale stable for single notes and chords alike.
+        """
+        robot_onset_keys = {int(key) for key in np.flatnonzero(new_onsets)}
+        gt_true_onset_keys = set(self._score_true_onset_velocity_map(t_idx))
+        gt_active_keys = set(self._score_active_velocity_map(t_idx))
+
+        hit_count = len(robot_onset_keys & gt_true_onset_keys)
+        miss_count = len(gt_true_onset_keys - robot_onset_keys)
+        hold_rehit_count = len(
+            robot_onset_keys & (gt_active_keys - gt_true_onset_keys)
+        )
+        offscore_fp_count = len(robot_onset_keys - gt_active_keys)
+
+        gt_onset_denom = max(len(gt_true_onset_keys), 1)
+        robot_onset_denom = max(len(robot_onset_keys), 1)
+        return (
+            hit_count / gt_onset_denom,
+            miss_count / gt_onset_denom,
+            offscore_fp_count / robot_onset_denom,
+            hold_rehit_count / robot_onset_denom,
+        )
+
+    def _compute_onset_accuracy_reward(self, physics: mjcf.Physics) -> float:
+        """Event-level reward for onset correctness.
+
+        This term does not replace `key_press_reward`.
+        Instead:
+        - `key_press_reward` keeps giving dense shaping for key state.
+        - `onset_accuracy_reward` adds explicit event semantics for
+          true-onset hit/miss, off-score onsets, and hold retriggers.
+
+        The first couple of control steps do not penalize hold retriggers.
+        With `initial_buffer_time`, some notes can already be score-active at
+        episode start, so early late entries should not be over-penalized.
+        """
+        del physics  # Unused.
+        activation = self.piano.activation
+        new_onsets = activation & ~self._prev_activation
+        t = self._t_idx - 1
+
+        (
+            hit_rate,
+            miss_rate,
+            offscore_fp_rate,
+            hold_rehit_rate,
+        ) = self._get_onset_accuracy_rates(new_onsets, t)
+
+        if t < _ONSET_ACCURACY_HOLD_REHIT_GRACE_STEPS:
+            hold_rehit_rate = 0.0
+
+        raw_reward = (
+            _ONSET_ACCURACY_HIT_BONUS * hit_rate
+            - _ONSET_ACCURACY_MISS_PENALTY * miss_rate
+            - _ONSET_ACCURACY_OFFSCORE_FP_PENALTY * offscore_fp_rate
+            - _ONSET_ACCURACY_HOLD_REHIT_PENALTY * hold_rehit_rate
+        )
+        return self._onset_accuracy_reward_coef * raw_reward
 
     def _compute_velocity_reward(self, physics: mjcf.Physics) -> float:
         """Compute the current velocity reward.

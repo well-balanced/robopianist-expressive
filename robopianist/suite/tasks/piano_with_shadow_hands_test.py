@@ -144,6 +144,7 @@ def _get_env(
     style_velocity_scale: float = 1.0,
     velocity_onset_window_steps: int = 0,
     style_velocity_scale_choices: Optional[Sequence[float]] = None,
+    onset_accuracy_reward_coef: float = 0.0,
 ) -> composer.Environment:
     task_kwargs = dict(
         midi=midi or _get_test_midi(dt=control_timestep),
@@ -155,6 +156,7 @@ def _get_env(
         disable_fingering_reward=disable_fingering_reward,
         style_velocity_scale=style_velocity_scale,
         style_velocity_scale_choices=style_velocity_scale_choices,
+        onset_accuracy_reward_coef=onset_accuracy_reward_coef,
     )
     if velocity_onset_window_steps != 0:
         task_kwargs["velocity_onset_window_steps"] = velocity_onset_window_steps
@@ -383,6 +385,61 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
 
         metadata = env.task.get_score_key_metadata(1, key_id)
         self.assertTrue(metadata.score_sustain)
+
+    def test_onset_accuracy_reward_is_registered_only_when_enabled(self) -> None:
+        disabled_env = _get_env(onset_accuracy_reward_coef=0.0)
+        self.assertNotIn(
+            "onset_accuracy_reward", disabled_env.task.reward_fn.reward_fns
+        )
+
+        enabled_env = _get_env(onset_accuracy_reward_coef=1.0)
+        self.assertIn("onset_accuracy_reward", enabled_env.task.reward_fn.reward_fns)
+
+    def test_onset_accuracy_reward_hits_and_misses_true_onsets(self) -> None:
+        env = _get_env(onset_accuracy_reward_coef=1.0)
+        task = env.task
+        c6 = midi_file.note_name_to_key_number("C6")
+        d6 = midi_file.note_name_to_key_number("D6")
+
+        task._score_active_velocity_maps = [{c6: 80, d6: 72}]
+        task._score_true_onset_velocity_maps = [{c6: 80, d6: 72}]
+        task._t_idx = 1
+        task._prev_activation[:] = False
+        task.piano._activation[:] = False
+        task.piano._activation[c6] = True
+
+        reward = task._compute_onset_accuracy_reward(env.physics)
+        self.assertAlmostEqual(reward, 0.1)
+
+    def test_onset_accuracy_reward_penalizes_offscore_fp(self) -> None:
+        env = _get_env(onset_accuracy_reward_coef=1.0)
+        task = env.task
+        c6 = midi_file.note_name_to_key_number("C6")
+
+        task._score_active_velocity_maps = [{}]
+        task._score_true_onset_velocity_maps = [{}]
+        task._t_idx = 1
+        task._prev_activation[:] = False
+        task.piano._activation[:] = False
+        task.piano._activation[c6] = True
+
+        reward = task._compute_onset_accuracy_reward(env.physics)
+        self.assertAlmostEqual(reward, -0.05)
+
+    def test_onset_accuracy_reward_penalizes_hold_rehit(self) -> None:
+        env = _get_env(onset_accuracy_reward_coef=1.0)
+        task = env.task
+        c6 = midi_file.note_name_to_key_number("C6")
+
+        task._score_active_velocity_maps = [{}, {}, {c6: 80}]
+        task._score_true_onset_velocity_maps = [{}, {}, {}]
+        task._t_idx = 3
+        task._prev_activation[:] = False
+        task.piano._activation[:] = False
+        task.piano._activation[c6] = True
+
+        reward = task._compute_onset_accuracy_reward(env.physics)
+        self.assertAlmostEqual(reward, -0.2)
 
     @absltest.skipUnless(
         _HAS_LEGACY_MATCHED_ONSET_API,
