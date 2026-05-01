@@ -239,8 +239,8 @@
 
 - **보류 사항**:
   - base policy에 `goal_true_onset` 넣기
-  - actor/critic privileged split
-  - critic decomposition (`B`, `B+C`)
+  - `DenseCritic / EventCritic` 분리
+  - `EventCritic`에 GT onset 정보 추가
 
 - **구현 방향**:
   - `goal_active` observable 복구
@@ -252,3 +252,32 @@
   - 기존 velocity-scaled `goal`을 binary support `goal`로 되돌렸다.
   - `goal_velocity`와 `goal_true_onset` observable을 별도 채널로 추가했다.
   - 현재 env는 from-scratch observation v1에 필요한 raw signal을 모두 제공하며, `robopianist-rl` 쪽 explicit observation wrapper가 이를 base/residual/critic 입력으로 재조립한다.
+
+## 2026-05-01
+
+### rendered audio evaluation v1.0
+
+- `MidiEvaluationWrapper`의 기존 loudness lookup 기반 보조 metric을 실제 synth render 기반 metric으로 교체했다.
+- 제거한 항목:
+  - `rms_similarity`
+  - `loudness_*`
+  - `perceptual_dynamics_score`
+- 새 평가 흐름:
+  - GT는 task의 discretized note trajectory에서 MIDI event를 재구성한다.
+  - robot은 episode 동안 기록한 `activation / sustain / onset velocity` trace에서 MIDI event를 재구성한다.
+  - 두 MIDI event sequence를 동일 synthesizer로 렌더링한 뒤 waveform / RMS envelope 차이를 계산한다.
+- 새 metric:
+  - `audio_wave_mae`
+  - `audio_wave_rel_mae`
+  - `audio_rms_env_mae`
+  - `audio_rms_env_rel_mae`
+  - `audio_rms_env_corr`
+  - `audio_similarity`
+  - `audio_fidelity`
+- `audio_similarity`는 절대 MAE가 아니라 GT audio scale로 정규화한 상대오차 기반으로 정의를 바꿨다.
+  - 초기 버전의 `1 - env_mae`는 silent / low-amplitude 구간이 길 때 값이 과도하게 1에 붙는 문제가 있었다.
+  - 현재는 waveform similarity와 envelope similarity를 각각 relative MAE로 계산한 뒤 harmonic mean으로 합친다.
+- wrapper는 이제 최근 eval episode의 아래 artifact도 직접 보존한다.
+  - rendered `robot_waveform`, `gt_waveform`
+  - serialized `robot_events`, `gt_events`
+- 관련 테스트를 업데이트해, fake env에서도 rendered-audio metric 경로가 직접 검증되도록 했다.

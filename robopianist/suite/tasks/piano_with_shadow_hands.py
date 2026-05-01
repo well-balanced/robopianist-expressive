@@ -58,6 +58,19 @@ _VELOCITY_V2_HOLD_PENALTY_GRACE_STEPS = 2
 _VELOCITY_V2_UNEXPECTED_HOLD_ONSET_PENALTY = 0.20
 _VELOCITY_V2_PREMATURE_RELEASE_PENALTY = 0.10
 
+_DENSE_REWARD_TERM_NAMES = (
+    "key_press_reward",
+    "sustain_reward",
+    "energy_reward",
+    "fingering_reward",
+    "ot_fingering_reward",
+    "forearm_reward",
+)
+_EVENT_REWARD_TERM_NAMES = (
+    "onset_accuracy_reward",
+    "velocity_reward",
+)
+
 
 # Transparency of fingertip geoms.
 _FINGERTIP_ALPHA = 1.0
@@ -262,6 +275,9 @@ class PianoWithShadowHands(base.PianoTask):
         self._true_onset_goal_state: np.ndarray = np.zeros(
             (self._n_steps_velocity_lookahead + 1, self.piano.n_keys), dtype=np.float64
         )
+        self._true_onset_velocity_goal_state: np.ndarray = np.zeros(
+            (self._n_steps_velocity_lookahead + 1, self.piano.n_keys), dtype=np.float64
+        )
         # v2 compares the current matched-onset mean against recent matched-onset
         # history, so these episode-local accumulators reset every episode.
         self._prev_velocity_reward_robot_mean: Optional[float] = None
@@ -420,6 +436,20 @@ class PianoWithShadowHands(base.PianoTask):
     def get_discount(self, physics: mjcf.Physics) -> float:
         del physics  # Unused.
         return self._discount
+
+    def get_grouped_reward_terms(self) -> Dict[str, float]:
+        reward_terms = self._reward_fn.reward_terms
+        dense_reward = float(
+            sum(reward_terms.get(name, 0.0) for name in _DENSE_REWARD_TERM_NAMES)
+        )
+        event_reward = float(
+            sum(reward_terms.get(name, 0.0) for name in _EVENT_REWARD_TERM_NAMES)
+        )
+        return {
+            "dense_reward": dense_reward,
+            "event_reward": event_reward,
+            "reward_total": dense_reward + event_reward,
+        }
 
     def should_terminate_episode(self, physics: mjcf.Physics) -> bool:
         del physics  # Unused.
@@ -909,6 +939,19 @@ class PianoWithShadowHands(base.PianoTask):
             for key in self._score_true_onset_velocity_map(t):
                 self._true_onset_goal_state[i, key] = 1.0
 
+    def _update_true_onset_velocity_goal_state(self) -> None:
+        if self._t_idx == len(self._notes):
+            return
+        self._true_onset_velocity_goal_state = np.zeros(
+            (self._n_steps_velocity_lookahead + 1, self.piano.n_keys),
+            dtype=np.float64,
+        )
+        t_start = self._t_idx
+        t_end = min(t_start + self._n_steps_velocity_lookahead + 1, len(self._notes))
+        for i, t in enumerate(range(t_start, t_end)):
+            for key, velocity in self._score_true_onset_velocity_map(t).items():
+                self._true_onset_velocity_goal_state[i, key] = velocity / 127.0
+
     def _update_fingering_state(self) -> None:
         if self._t_idx == len(self._notes):
             return
@@ -999,6 +1042,20 @@ class PianoWithShadowHands(base.PianoTask):
         goal_true_onset_observable = observable.Generic(_get_goal_true_onset_state)
         goal_true_onset_observable.enabled = True
         self._task_observables["goal_true_onset"] = goal_true_onset_observable
+
+        # True-onset velocity target: short-horizon GT onset velocity map.
+        def _get_goal_true_onset_velocity_state(physics) -> np.ndarray:
+            del physics  # Unused.
+            self._update_true_onset_velocity_goal_state()
+            return self._true_onset_velocity_goal_state.ravel()
+
+        goal_true_onset_velocity_observable = observable.Generic(
+            _get_goal_true_onset_velocity_state
+        )
+        goal_true_onset_velocity_observable.enabled = True
+        self._task_observables["goal_true_onset_velocity"] = (
+            goal_true_onset_velocity_observable
+        )
 
         # This adds fingering information for the current timestep.
         def _get_fingering_state(physics) -> np.ndarray:

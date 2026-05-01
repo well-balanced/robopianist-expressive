@@ -50,17 +50,27 @@ class _FakeTask:
         score_velocity: int,
         onset_qvel: float,
     ) -> None:
+        self._key_id = key_id
         self._prev_activation = np.zeros((88,), dtype=bool)
         self._t_idx = 1
         self._notes = [[SimpleNamespace(key=key_id, velocity=score_velocity)]]
         self._sustains = [int(metadata.score_sustain)]
+        self.control_timestep = 0.05
         self.reward_fn = SimpleNamespace(reward_terms={})
         self.piano = _FakePiano(key_id, onset_qvel)
         self._metadata = metadata
 
     def get_score_key_metadata(self, t_idx: int, key_id: int) -> ScoreKeyMetadata:
-        del t_idx, key_id  # Unused in the fixed test setup.
-        return self._metadata
+        del t_idx  # Unused in the fixed test setup.
+        if key_id == self._key_id:
+            return self._metadata
+        return ScoreKeyMetadata(
+            score_key_active=False,
+            gt_is_true_onset=False,
+            score_sustain=False,
+            gt_active_midi_vel=None,
+            gt_true_onset_midi_vel=None,
+        )
 
 
 class _FakeEnv(dm_env.Environment):
@@ -125,6 +135,16 @@ class MidiEvaluationWrapperTest(absltest.TestCase):
         self.assertFalse(row["gt_is_true_onset"])
         self.assertTrue(row["score_sustain"])
         self.assertTrue(row["robot_new_onset"])
+        musical_metrics = env.get_musical_metrics()
+        self.assertIn("onset_precision", musical_metrics)
+        self.assertNotIn("success_rate", musical_metrics)
+        self.assertEqual(musical_metrics["onset_precision"], 0.0)
+        self.assertEqual(musical_metrics["onset_f1"], 0.0)
+        episode_rows = env.get_episode_metrics_table()
+        self.assertLen(episode_rows, 1)
+        self.assertNotIn("success", episode_rows[0])
+        self.assertIn("audio_similarity", episode_rows[0])
+        self.assertIn("audio_fidelity", episode_rows[0])
         metrics = env.get_velocity_metrics()
         self.assertEmpty(metrics)
 
@@ -170,16 +190,31 @@ class MidiEvaluationWrapperTest(absltest.TestCase):
         self.assertTrue(row["robot_new_onset"])
         self.assertEqual(row["robot_midi_vel"], expected_robot_midi_vel)
         self.assertAlmostEqual(row["needed_qvel"], round(expected_needed_qvel, 4))
+        musical_metrics = env.get_musical_metrics()
+        self.assertEqual(musical_metrics["onset_precision"], 1.0)
+        self.assertEqual(musical_metrics["onset_recall"], 1.0)
+        self.assertEqual(musical_metrics["onset_f1"], 1.0)
+        episode_rows = env.get_episode_metrics_table()
+        self.assertLen(episode_rows, 1)
+        self.assertIn("audio_similarity", episode_rows[0])
+        self.assertIn("audio_fidelity", episode_rows[0])
+        audio_metrics = env.get_audio_metrics()
+        self.assertIn("audio_wave_mae", audio_metrics)
+        self.assertIn("audio_rms_env_mae", audio_metrics)
+        self.assertIn("audio_rms_env_corr", audio_metrics)
+        renderings = env.get_latest_audio_renderings()
+        self.assertIn("robot_waveform", renderings)
+        self.assertIn("gt_waveform", renderings)
+        self.assertIn("robot_events", renderings)
+        self.assertIn("gt_events", renderings)
         metrics = env.get_velocity_metrics()
         expected_error = abs(expected_robot_midi_vel - gt_midi_vel)
         self.assertAlmostEqual(metrics["velocity_mae"], float(expected_error))
         self.assertAlmostEqual(metrics["velocity_bias"], float(expected_robot_midi_vel - gt_midi_vel))
-        self.assertIn("perceptual_dynamics_score", metrics)
-        # With a single matched onset, loud_corr is nan → s_corr=0 → PDS=0.
-        self.assertEqual(metrics["perceptual_dynamics_score"], 0.0)
+        self.assertNotIn("perceptual_dynamics_score", metrics)
 
-    def test_pds_is_present_and_bounded(self) -> None:
-        """PDS is present in velocity metrics and lies in [0, 1]."""
+    def test_audio_metrics_are_present(self) -> None:
+        """Rendered-audio metrics are present and numerically well-formed."""
         key_id = 40
         onset_qvel = 2.0
         gt_midi_vel = 64
@@ -198,11 +233,12 @@ class MidiEvaluationWrapperTest(absltest.TestCase):
         env.reset()
         env.step(np.zeros((1,), dtype=np.float32))
 
-        metrics = env.get_velocity_metrics()
-        self.assertIn("perceptual_dynamics_score", metrics)
-        pds = metrics["perceptual_dynamics_score"]
-        # Single onset → loud_corr is nan → s_corr=0 → PDS=0.
-        self.assertEqual(pds, 0.0)
+        metrics = env.get_audio_metrics()
+        self.assertIn("audio_wave_mae", metrics)
+        self.assertIn("audio_rms_env_mae", metrics)
+        self.assertIn("audio_rms_env_corr", metrics)
+        self.assertGreaterEqual(metrics["audio_wave_mae"], 0.0)
+        self.assertGreaterEqual(metrics["audio_rms_env_mae"], 0.0)
 
 
 if __name__ == "__main__":

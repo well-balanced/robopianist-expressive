@@ -180,6 +180,7 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
         self.assertIn("goal", timestep.observation)
         self.assertIn("goal_velocity", timestep.observation)
         self.assertIn("goal_true_onset", timestep.observation)
+        self.assertIn("goal_true_onset_velocity", timestep.observation)
         if disable_fingering_reward:
             self.assertNotIn("fingering", timestep.observation)
         else:
@@ -357,6 +358,53 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
             actual_goal_true_onset = timestep.observation["goal_true_onset"]
             np.testing.assert_array_equal(
                 actual_goal_true_onset, expected_goal_true_onset.ravel()
+            )
+
+            prev_active_keys = {note.key for note in notes[i]}
+            timestep = env.step(zero_action)
+
+    @parameterized.parameters(0, 1, 3)
+    def test_goal_true_onset_velocity_observable_lookahead(
+        self, n_steps_velocity_lookahead: int
+    ) -> None:
+        env = _get_env(
+            control_timestep=0.01,
+            midi=_get_test_midi(dt=0.01),
+            n_steps_velocity_lookahead=n_steps_velocity_lookahead,
+        )
+        action_spec = env.action_spec()
+        zero_action = np.zeros(action_spec.shape)
+        timestep = env.reset()
+
+        midi = _get_test_midi(dt=0.01)
+        note_traj = midi_file.NoteTrajectory.from_midi(
+            midi, dt=env.task.control_timestep
+        )
+        notes = note_traj.notes
+        prev_active_keys = set()
+
+        for i in range(len(notes)):
+            expected_goal_true_onset_velocity = np.zeros(
+                (n_steps_velocity_lookahead + 1, env.task.piano.n_keys)
+            )
+            local_prev_active_keys = prev_active_keys.copy()
+            t_start = i
+            t_end = min(i + n_steps_velocity_lookahead + 1, len(notes))
+            for j, t in enumerate(range(t_start, t_end)):
+                active_notes = {note.key: note.velocity for note in notes[t]}
+                true_onset_keys = set(active_notes) - local_prev_active_keys
+                for key in true_onset_keys:
+                    expected_goal_true_onset_velocity[j, key] = (
+                        active_notes[key] / 127.0
+                    )
+                local_prev_active_keys = set(active_notes)
+
+            actual_goal_true_onset_velocity = timestep.observation[
+                "goal_true_onset_velocity"
+            ]
+            np.testing.assert_array_equal(
+                actual_goal_true_onset_velocity,
+                expected_goal_true_onset_velocity.ravel(),
             )
 
             prev_active_keys = {note.key for note in notes[i]}
@@ -715,6 +763,39 @@ class PianoWithShadowHandsTest(parameterized.TestCase):
             self.assertNotIn("fingering_reward", reward_terms)
         else:
             self.assertIn("fingering_reward", reward_terms)
+
+    def test_grouped_reward_terms_split_dense_and_event_components(self) -> None:
+        env = _get_env(onset_accuracy_reward_coef=1.0)
+        action_spec = env.action_spec()
+        zero_action = np.zeros(action_spec.shape)
+
+        env.reset()
+        env.step(zero_action)
+
+        reward_terms = env.task.reward_fn.reward_terms
+        grouped_terms = env.task.get_grouped_reward_terms()
+
+        expected_dense = sum(
+            reward_terms.get(name, 0.0)
+            for name in (
+                "key_press_reward",
+                "sustain_reward",
+                "energy_reward",
+                "fingering_reward",
+                "ot_fingering_reward",
+                "forearm_reward",
+            )
+        )
+        expected_event = sum(
+            reward_terms.get(name, 0.0)
+            for name in ("onset_accuracy_reward", "velocity_reward")
+        )
+
+        self.assertAlmostEqual(grouped_terms["dense_reward"], expected_dense)
+        self.assertAlmostEqual(grouped_terms["event_reward"], expected_event)
+        self.assertAlmostEqual(
+            grouped_terms["reward_total"], expected_dense + expected_event
+        )
 
     # TODO(kevin): Add unit tests for individual reward components.
     # TODO(kevin): Add unit tests for augmentation / midi selection.
