@@ -55,6 +55,48 @@ class RoboPianistSuiteTest(parameterized.TestCase):
                 ).astype(action_spec.dtype)
                 timestep = env.step(action)
 
+    def test_train_style_velocity_scales_is_sampled_per_episode(self) -> None:
+        env = suite.load(
+            environment_name=suite.DEBUG[0],
+            seed=_SEED,
+            train_style_velocity_scales=(0.8, 1.0, 1.2),
+        )
+
+        seen_scales = set()
+        for _ in range(8):
+            env.reset()
+            seen_scales.add(env.task.current_style_velocity_scale)
+
+        self.assertTrue(seen_scales.issubset({0.8, 1.0, 1.2}))
+        self.assertGreaterEqual(len(seen_scales), 2)
+
+    def test_train_style_velocity_scales_rejects_fixed_scale_combo(self) -> None:
+        with self.assertRaisesRegex(ValueError, "cannot be used together"):
+            suite.load(
+                environment_name=suite.DEBUG[0],
+                seed=_SEED,
+                style_velocity_scale=0.9,
+                train_style_velocity_scales=(0.8, 1.0, 1.2),
+            )
+
+    def test_train_style_velocity_scales_rejects_other_style_transforms(self) -> None:
+        with self.assertRaisesRegex(ValueError, "only supports"):
+            suite.load(
+                environment_name=suite.DEBUG[0],
+                seed=_SEED,
+                train_style_velocity_scales=(0.8, 1.0, 1.2),
+                style_velocity_contrast=1.1,
+            )
+
+    def test_train_style_velocity_scales_rejects_task_level_choices(self) -> None:
+        with self.assertRaisesRegex(ValueError, "Pass mixed training scales via"):
+            suite.load(
+                environment_name=suite.DEBUG[0],
+                seed=_SEED,
+                train_style_velocity_scales=(0.8, 1.0, 1.2),
+                task_kwargs={"style_velocity_scale_choices": (0.8, 1.0, 1.2)},
+            )
+
 
 if __name__ == "__main__":
     absltest.main()

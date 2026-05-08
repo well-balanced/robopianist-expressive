@@ -15,12 +15,13 @@
 """RoboPianist suite."""
 
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Union
+from typing import Any, Dict, Mapping, Optional, Tuple, Union
 
 from dm_control import composer
 from mujoco_utils import composer_utils
 
 from robopianist import music
+from robopianist.music.style_transform import apply_style
 from robopianist.suite.tasks import piano_with_shadow_hands
 
 # RoboPianist-repertoire-150.
@@ -56,6 +57,11 @@ def load(
     recompile_physics: bool = False,
     legacy_step: bool = True,
     task_kwargs: Optional[Mapping[str, Any]] = None,
+    style_velocity_scale: float = 1.0,
+    train_style_velocity_scales: Tuple[float, ...] = (),
+    style_velocity_contrast: float = 1.0,
+    style_melody_gain: float = 1.0,
+    style_dynamic_trend: float = 0.0,
 ) -> composer.Environment:
     """Loads a RoboPianist environment.
 
@@ -71,6 +77,12 @@ def load(
         recompile_physics: Whether to recompile the physics.
         legacy_step: Whether to use the legacy step function.
         task_kwargs: Additional keyword arguments to pass to the task.
+        style_velocity_scale: Fixed global velocity multiplier applied to every
+            episode. Used for evaluation and single-scale training.
+        train_style_velocity_scales: Optional tuple of velocity scales to sample
+            from at the beginning of each training episode. When provided, the
+            MIDI is kept unstyled here and the task reapplies a sampled scale at
+            reset time.
     """
     if midi_file is not None:
         midi = music.load(midi_file, stretch=stretch, shift=shift)
@@ -82,7 +94,45 @@ def load(
             )
         midi = music.load(_ALL_DICT[environment_name], stretch=stretch, shift=shift)
 
-    task_kwargs = task_kwargs or {}
+    task_kwargs = dict(task_kwargs or {})
+    train_style_velocity_scales = tuple(train_style_velocity_scales)
+
+    if train_style_velocity_scales:
+        if "style_velocity_scale_choices" in task_kwargs:
+            raise ValueError(
+                "Pass mixed training scales via train_style_velocity_scales, not "
+                "task_kwargs['style_velocity_scale_choices']."
+            )
+        if style_velocity_scale != 1.0:
+            raise ValueError(
+                "style_velocity_scale and train_style_velocity_scales cannot be "
+                "used together."
+            )
+        if (
+            style_velocity_contrast != 1.0
+            or style_melody_gain != 1.0
+            or style_dynamic_trend != 0.0
+        ):
+            raise ValueError(
+                "train_style_velocity_scales currently only supports "
+                "velocity_scale randomization."
+            )
+        task_kwargs["style_velocity_scale_choices"] = train_style_velocity_scales
+
+    # Apply velocity style transforms if any are non-default.
+    if not train_style_velocity_scales and (
+        style_velocity_scale != 1.0
+        or style_velocity_contrast != 1.0
+        or style_melody_gain != 1.0
+        or style_dynamic_trend != 0.0
+    ):
+        midi = apply_style(
+            midi,
+            velocity_scale=style_velocity_scale,
+            velocity_contrast=style_velocity_contrast,
+            melody_gain=style_melody_gain,
+            dynamic_trend=style_dynamic_trend,
+        )
 
     return composer_utils.Environment(
         task=piano_with_shadow_hands.PianoWithShadowHands(midi=midi, **task_kwargs),

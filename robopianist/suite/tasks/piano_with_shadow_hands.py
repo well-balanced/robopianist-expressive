@@ -14,7 +14,7 @@
 
 """A task where two shadow hands must play a given MIDI file on a piano."""
 
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 from scipy.optimize import linear_sum_assignment
@@ -28,7 +28,9 @@ from mujoco_utils import collision_utils, spec_utils
 
 import robopianist.models.hands.shadow_hand_constants as hand_consts
 from robopianist.models.arenas import stage
+from robopianist.models.piano.midi_module import MAX_KEY_VEL as _MAX_KEY_VEL, QVEL_MIN as _QVEL_MIN
 from robopianist.music import midi_file
+from robopianist.music.style_transform import apply_style
 from robopianist.suite import composite_reward
 from robopianist.suite.tasks import base
 
@@ -39,11 +41,41 @@ _KEY_CLOSE_ENOUGH_TO_PRESSED = 0.05
 # Energy penalty coefficient.
 _ENERGY_PENALTY_COEF = 5e-3
 
+# Key press reward coefficient.
+_KEY_PRESS_REWARD_COEF = 1.0
+
+# Onset accuracy reward coefficient.
+_ONSET_ACCURACY_REWARD_COEF = 0.0
+_ONSET_ACCURACY_HOLD_REHIT_GRACE_STEPS = 2
+_ONSET_ACCURACY_HIT_BONUS = 0.30
+_ONSET_ACCURACY_MISS_PENALTY = 0.10
+_ONSET_ACCURACY_OFFSCORE_FP_PENALTY = 0.05
+_ONSET_ACCURACY_HOLD_REHIT_PENALTY = 0.20
+
+# Velocity reward coefficient.
+_VELOCITY_REWARD_COEF = 1.0
+_VELOCITY_V2_HOLD_PENALTY_GRACE_STEPS = 2
+_VELOCITY_V2_UNEXPECTED_HOLD_ONSET_PENALTY = 0.20
+_VELOCITY_V2_PREMATURE_RELEASE_PENALTY = 0.10
+
+
 # Transparency of fingertip geoms.
 _FINGERTIP_ALPHA = 1.0
 
 # Bounds for the uniform distribution from which initial hand offset is sampled.
 _POSITION_OFFSET = 0.05
+
+
+class ScoreKeyMetadata(NamedTuple):
+    """Ground-truth score metadata for a single key at a single timestep."""
+
+    score_key_active: bool
+    gt_is_true_onset: bool
+    score_sustain: bool
+    gt_active_midi_vel: Optional[int]
+    gt_true_onset_midi_vel: Optional[int]
+
+
 
 
 class PianoWithShadowHands(base.PianoTask):
@@ -61,7 +93,17 @@ class PianoWithShadowHands(base.PianoTask):
         disable_hand_collisions: bool = False,
         augmentations: Optional[Sequence[base_variation.Variation]] = None,
         energy_penalty_coef: float = _ENERGY_PENALTY_COEF,
+        key_press_reward_coef: float = _KEY_PRESS_REWARD_COEF,
+        onset_accuracy_reward_coef: float = _ONSET_ACCURACY_REWARD_COEF,
         randomize_hand_positions: bool = False,
+        velocity_reward_coef: float = _VELOCITY_REWARD_COEF,
+        disable_velocity_reward: bool = False,
+        velocity_reward_version: str = "v1.0",
+        use_velocity_reward_v2: bool = False,
+        style_velocity_scale: float = 1.0,
+        style_velocity_scale_choices: Optional[Sequence[float]] = None,
+        n_steps_velocity_lookahead: int = 3,
+        compact_residual_obs: bool = False,
         **kwargs,
     ) -> None:
         """Task constructor.
@@ -88,19 +130,62 @@ class PianoWithShadowHands(base.PianoTask):
             disable_colorization: If True, disables the colorization of the fingertips
                 and corresponding keys.
             disable_hand_collisions: If True, disables collisions between the two hands.
+            disable_velocity_reward: If True, disables the velocity reward term.
+            velocity_reward_version: Legacy launch string for the velocity reward
+                path. For backward compatibility, strings starting with `"v2"`
+                select the current v2 reward and all other values select the
+                current v1 reward.
+            use_velocity_reward_v2: If True, forces the current v2 reward path.
+                Kept for backward compatibility with older launch commands.
+            style_velocity_scale: Fixed velocity scale applied to the score when
+                no per-episode sampling is requested.
+            style_velocity_scale_choices: Optional list/tuple of velocity scales to
+                sample from at the beginning of each episode. This is intended for
+                mixed-scale training where one policy should see multiple target
+                velocity distributions.
             augmentations: A list of `Variation` objects that will be applied to the
                 MIDI file at the beginning of each episode. If None, no augmentations
                 will be applied.
             energy_penalty_coef: Coefficient for the energy penalty.
+            key_press_reward_coef: Coefficient for the key press reward. Scales the
+                key press reward term relative to other reward components.
+            onset_accuracy_reward_coef: Coefficient for the onset-accuracy reward.
+                This event-level reward is separate from the dense key-state reward:
+                it rewards correct true onsets and penalizes missed onsets,
+                off-score onsets, and hold retriggers. Set to 0.0 to disable it.
+            velocity_reward_coef: Coefficient for the velocity reward. Scales the
+                velocity reward term relative to other reward components.
             randomize_hand_positions: If True, randomizes the initial position of the
                 hands at the beginning of each episode.
+            n_steps_velocity_lookahead: Number of timesteps to look ahead in the
+                velocity goal observable. Independent of n_steps_lookahead.
         """
         super().__init__(arena=stage.Stage(), **kwargs)
+        if onset_accuracy_reward_coef < 0.0:
+            raise ValueError("onset_accuracy_reward_coef must be non-negative.")
 
         if trim_silence:
             midi = midi.trim_silence()
-        self._midi = midi
         self._initial_midi = midi
+        self._style_velocity_scale = float(style_velocity_scale)
+        if self._style_velocity_scale <= 0.0:
+            raise ValueError("style_velocity_scale must be positive.")
+        if style_velocity_scale_choices is None:
+            self._style_velocity_scale_choices = ()
+        else:
+            self._style_velocity_scale_choices = tuple(
+                float(scale) for scale in style_velocity_scale_choices
+            )
+            if not self._style_velocity_scale_choices:
+                raise ValueError("style_velocity_scale_choices cannot be empty.")
+            if any(scale <= 0.0 for scale in self._style_velocity_scale_choices):
+                raise ValueError(
+                    "All style_velocity_scale_choices entries must be positive."
+                )
+        self._current_style_velocity_scale = self._style_velocity_scale
+        self._midi = self._style_midi(
+            midi=self._initial_midi, velocity_scale=self._current_style_velocity_scale
+        )
         self._n_steps_lookahead = n_steps_lookahead
         if n_seconds_lookahead is not None:
             self._n_steps_lookahead = int(
@@ -111,12 +196,23 @@ class PianoWithShadowHands(base.PianoTask):
             disable_fingering_reward or not self._midi.has_fingering()
         )
         self._disable_forearm_reward = disable_forearm_reward
+        self._velocity_reward_coef = velocity_reward_coef
+        self._disable_velocity_reward = disable_velocity_reward
+        self._use_velocity_reward_v2 = (
+            use_velocity_reward_v2 or velocity_reward_version.startswith("v2")
+        )
+        self._n_steps_velocity_lookahead = n_steps_velocity_lookahead
         self._wrong_press_termination = wrong_press_termination
         self._disable_colorization = disable_colorization
         self._disable_hand_collisions = disable_hand_collisions
         self._augmentations = augmentations
         self._energy_penalty_coef = energy_penalty_coef
+        self._key_press_reward_coef = key_press_reward_coef
+        self._onset_accuracy_reward_coef = onset_accuracy_reward_coef
+        self._compact_residual_obs = compact_residual_obs
         self._randomize_hand_positions = randomize_hand_positions
+        self._score_active_velocity_maps: List[Dict[int, int]] = []
+        self._score_true_onset_velocity_maps: List[Dict[int, int]] = []
 
         if not disable_fingering_reward and not disable_colorization:
             self._colorize_fingertips()
@@ -133,6 +229,10 @@ class PianoWithShadowHands(base.PianoTask):
             sustain_reward=self._compute_sustain_reward,
             energy_reward=self._compute_energy_reward,
         )
+        if self._onset_accuracy_reward_coef > 0.0:
+            self._reward_fn.add(
+                "onset_accuracy_reward", self._compute_onset_accuracy_reward
+            )
         if not self._disable_fingering_reward:
             self._reward_fn.add("fingering_reward", self._compute_fingering_reward)
         else:
@@ -143,18 +243,65 @@ class PianoWithShadowHands(base.PianoTask):
         if not self._disable_forearm_reward:
             self._reward_fn.add("forearm_reward", self._compute_forearm_reward)
 
+        if not self._disable_velocity_reward:
+            self._reward_fn.add("velocity_reward", self._compute_velocity_reward)
+
     def _reset_quantities_at_episode_init(self) -> None:
         self._t_idx: int = 0
         self._should_terminate: bool = False
         self._discount: float = 1.0
+        self._goal_current: np.ndarray = np.zeros(
+            self.piano.n_keys + 1, dtype=np.float64
+        )
+        self._prev_activation: np.ndarray = np.zeros(
+            self.piano.n_keys, dtype=bool
+        )
+        self._velocity_goal_state: np.ndarray = np.zeros(
+            (self._n_steps_velocity_lookahead + 1, self.piano.n_keys), dtype=np.float64
+        )
+        # v2 compares the current matched-onset mean against recent matched-onset
+        # history, so these episode-local accumulators reset every episode.
+        self._prev_velocity_reward_robot_mean: Optional[float] = None
+        self._prev_velocity_reward_gt_mean: Optional[float] = None
+        self._recent_velocity_reward_errors: List[float] = []
+
+    @property
+    def current_style_velocity_scale(self) -> float:
+        return self._current_style_velocity_scale
+
+    @property
+    def style_velocity_scale_choices(self) -> Tuple[float, ...]:
+        return self._style_velocity_scale_choices
+
+    def _style_midi(
+        self, midi: midi_file.MidiFile, velocity_scale: float
+    ) -> midi_file.MidiFile:
+        if abs(velocity_scale - 1.0) <= 1e-9:
+            return midi
+        return apply_style(midi, velocity_scale=velocity_scale)
+
+    def _sample_style_velocity_scale(
+        self, random_state: np.random.RandomState
+    ) -> float:
+        if self._style_velocity_scale_choices:
+            return float(random_state.choice(self._style_velocity_scale_choices))
+        return self._style_velocity_scale
 
     def _maybe_change_midi(self, random_state: np.random.RandomState) -> None:
-        if self._augmentations is not None:
-            midi = self._initial_midi
-            for var in self._augmentations:
-                midi = var(initial_value=midi, random_state=random_state)
-            self._midi = midi
-            self._reset_trajectory()
+        if self._augmentations is None and not self._style_velocity_scale_choices:
+            return
+
+        midi = self._initial_midi
+        for var in self._augmentations or ():
+            midi = var(initial_value=midi, random_state=random_state)
+
+        self._current_style_velocity_scale = self._sample_style_velocity_scale(
+            random_state
+        )
+        self._midi = self._style_midi(
+            midi=midi, velocity_scale=self._current_style_velocity_scale
+        )
+        self._reset_trajectory()
 
     def _reset_trajectory(self) -> None:
         note_traj = midi_file.NoteTrajectory.from_midi(
@@ -163,6 +310,66 @@ class PianoWithShadowHands(base.PianoTask):
         note_traj.add_initial_buffer_time(self._initial_buffer_time)
         self._notes = note_traj.notes
         self._sustains = note_traj.sustains
+        self._precompute_score_velocity_maps()
+
+    def _precompute_score_velocity_maps(self) -> None:
+        """Precompute active-note and true-onset velocity maps for the score."""
+        self._score_active_velocity_maps = []
+        self._score_true_onset_velocity_maps = []
+
+        prev_active_keys = set()
+        for notes in self._notes:
+            active_velocity_map = {note.key: int(note.velocity) for note in notes}
+            true_onset_velocity_map = {
+                key: velocity
+                for key, velocity in active_velocity_map.items()
+                if key not in prev_active_keys
+            }
+            self._score_active_velocity_maps.append(active_velocity_map)
+            self._score_true_onset_velocity_maps.append(true_onset_velocity_map)
+            prev_active_keys = set(active_velocity_map)
+        # v2 gives a small extra weight to unusually soft/loud score notes, so it
+        # needs the piece-level center of the GT onset velocity distribution.
+        true_onset_velocities = [
+            velocity
+            for velocity_map in self._score_true_onset_velocity_maps
+            for velocity in velocity_map.values()
+        ]
+        if true_onset_velocities:
+            self._piece_velocity_median = float(np.median(true_onset_velocities))
+        else:
+            self._piece_velocity_median = 64.0
+
+    def _score_active_velocity_map(self, t_idx: int) -> Dict[int, int]:
+        if 0 <= t_idx < len(self._score_active_velocity_maps):
+            return self._score_active_velocity_maps[t_idx]
+        return {}
+
+    def _score_true_onset_velocity_map(self, t_idx: int) -> Dict[int, int]:
+        if 0 <= t_idx < len(self._score_true_onset_velocity_maps):
+            return self._score_true_onset_velocity_maps[t_idx]
+        return {}
+
+
+    def get_score_key_metadata(self, t_idx: int, key_id: int) -> ScoreKeyMetadata:
+        """Returns score-side metadata for a key at a timestep.
+
+        `score_key_active` answers whether the score expects the key to be active at
+        this timestep, while `gt_is_true_onset` answers whether this timestep is the
+        key's true GT onset. These are intentionally distinct because a long held note
+        can be score-active without being a new onset.
+        """
+        active_velocity_map = self._score_active_velocity_map(t_idx)
+        true_onset_velocity_map = self._score_true_onset_velocity_map(t_idx)
+        score_sustain = bool(self._sustains[t_idx]) if 0 <= t_idx < len(self._sustains) else False
+        return ScoreKeyMetadata(
+            score_key_active=(key_id in active_velocity_map),
+            gt_is_true_onset=(key_id in true_onset_velocity_map),
+            score_sustain=score_sustain,
+            gt_active_midi_vel=active_velocity_map.get(key_id),
+            gt_true_onset_midi_vel=true_onset_velocity_map.get(key_id),
+        )
+
 
     # Composer methods.
 
@@ -180,6 +387,7 @@ class PianoWithShadowHands(base.PianoTask):
         random_state: np.random.RandomState,
     ) -> None:
         """Applies the control to the hands and the sustain pedal to the piano."""
+        self._prev_activation = self.piano.activation.copy()
         action_right, action_left = np.split(action[:-1], 2)
         self.right_hand.apply_action(physics, action_right, random_state)
         self.left_hand.apply_action(physics, action_left, random_state)
@@ -276,6 +484,7 @@ class PianoWithShadowHands(base.PianoTask):
             rew -= self._energy_penalty_coef * np.sum(power)
         return rew
 
+
     def _compute_key_press_reward(self, physics: mjcf.Physics) -> float:
         """Reward for pressing the right keys at the right time."""
         del physics  # Unused.
@@ -295,7 +504,290 @@ class PianoWithShadowHands(base.PianoTask):
         # If there are any false positives, the remaining 0.5 reward is lost.
         off = np.flatnonzero(1 - self._goal_current[:-1])
         rew += 0.5 * (1 - float(self.piano.activation[off].any()))
-        return rew
+        return self._key_press_reward_coef * rew
+
+    def _get_onset_accuracy_rates(
+        self, new_onsets: np.ndarray, t_idx: int
+    ) -> Tuple[float, float, float, float]:
+        """Returns normalized onset-accuracy event rates for one timestep.
+
+        The four returned values are:
+        1. hit_rate: GT true onsets that the robot also created this step.
+        2. miss_rate: GT true onsets that the robot failed to create this step.
+        3. offscore_fp_rate: robot onsets on keys the score does not want active.
+        4. hold_rehit_rate: robot onsets on keys the score wanted to keep held.
+
+        We normalize hit/miss by the number of GT true onsets, and normalize
+        off-score / hold-rehit terms by the number of robot onsets. This keeps
+        the reward scale stable for single notes and chords alike.
+        """
+        robot_onset_keys = {int(key) for key in np.flatnonzero(new_onsets)}
+        gt_true_onset_keys = set(self._score_true_onset_velocity_map(t_idx))
+        gt_active_keys = set(self._score_active_velocity_map(t_idx))
+
+        hit_count = len(robot_onset_keys & gt_true_onset_keys)
+        miss_count = len(gt_true_onset_keys - robot_onset_keys)
+        hold_rehit_count = len(
+            robot_onset_keys & (gt_active_keys - gt_true_onset_keys)
+        )
+        offscore_fp_count = len(robot_onset_keys - gt_active_keys)
+
+        gt_onset_denom = max(len(gt_true_onset_keys), 1)
+        robot_onset_denom = max(len(robot_onset_keys), 1)
+        return (
+            hit_count / gt_onset_denom,
+            miss_count / gt_onset_denom,
+            offscore_fp_count / robot_onset_denom,
+            hold_rehit_count / robot_onset_denom,
+        )
+
+    def _compute_onset_accuracy_reward(self, physics: mjcf.Physics) -> float:
+        """Event-level reward for onset correctness.
+
+        This term does not replace `key_press_reward`.
+        Instead:
+        - `key_press_reward` keeps giving dense shaping for key state.
+        - `onset_accuracy_reward` adds explicit event semantics for
+          true-onset hit/miss, off-score onsets, and hold retriggers.
+
+        The first couple of control steps do not penalize hold retriggers.
+        With `initial_buffer_time`, some notes can already be score-active at
+        episode start, so early late entries should not be over-penalized.
+        """
+        del physics  # Unused.
+        activation = self.piano.activation
+        new_onsets = activation & ~self._prev_activation
+        t = self._t_idx - 1
+
+        (
+            hit_rate,
+            miss_rate,
+            offscore_fp_rate,
+            hold_rehit_rate,
+        ) = self._get_onset_accuracy_rates(new_onsets, t)
+
+        if t < _ONSET_ACCURACY_HOLD_REHIT_GRACE_STEPS:
+            hold_rehit_rate = 0.0
+
+        raw_reward = (
+            _ONSET_ACCURACY_HIT_BONUS * hit_rate
+            - _ONSET_ACCURACY_MISS_PENALTY * miss_rate
+            - _ONSET_ACCURACY_OFFSCORE_FP_PENALTY * offscore_fp_rate
+            - _ONSET_ACCURACY_HOLD_REHIT_PENALTY * hold_rehit_rate
+        )
+        return self._onset_accuracy_reward_coef * raw_reward
+
+    def _compute_velocity_reward(self, physics: mjcf.Physics) -> float:
+        """Compute the current velocity reward.
+
+        The codebase only keeps the latest v1 and v2 implementations in-tree.
+        Older variants live in git history, not as runtime branches.
+        """
+        if self._use_velocity_reward_v2:
+            return self._compute_velocity_reward_v2(physics)
+        return self._compute_velocity_reward_v1(physics)
+
+    def _compute_velocity_reward_v1(self, physics: mjcf.Physics) -> float:
+        """Simple matched-onset absolute velocity reward.
+
+        Flow:
+        1. detect robot onsets with `activation & ~prev_activation`
+        2. look up only score *true onsets* at the same timestep
+        3. give 0 on non-onset steps and unmatched robot onsets
+        4. score matched onsets with a sharp `tolerance()` on MIDI velocity
+
+        This keeps v1 intentionally simple:
+        - no contour term
+        - no running bias term
+        - no piece-level extreme weighting
+
+        Compared with the older v1, this removes the overly flat
+        `1 + loudness_calib.reward(...)` shaping and aligns the reward target
+        with the evaluation semantics, which also operate on matched true
+        onsets rather than all score-active keys.
+        """
+        del physics  # Unused.
+        new_onsets = self.piano.activation & ~self._prev_activation
+        if not new_onsets.any():
+            return 0.0
+
+        t = self._t_idx - 1
+        gt_true_onset_velocity_map = self._score_true_onset_velocity_map(t)
+        rewards = []
+        for key in np.flatnonzero(new_onsets):
+            gt_vel = gt_true_onset_velocity_map.get(int(key))
+            if gt_vel is None:
+                rewards.append(0.0)
+                continue
+            robot_midi_vel = (
+                int(
+                    np.clip(
+                        (self.piano._onset_velocities[key] - _QVEL_MIN)
+                        / (_MAX_KEY_VEL - _QVEL_MIN)
+                        * 126,
+                        0,
+                        126,
+                    )
+                )
+                + 1
+            )
+
+            lo = max(1, gt_vel - 3)
+            hi = min(127, gt_vel + 3)
+            accuracy = tolerance(
+                robot_midi_vel,
+                bounds=(lo, hi),
+                margin=20,
+                sigmoid="gaussian",
+                value_at_margin=0.05,
+            )
+            rewards.append(2.0 * float(accuracy) - 1.0)
+
+        return self._velocity_reward_coef * float(np.mean(rewards))
+
+    def _compute_velocity_reward_v2(self, physics: mjcf.Physics) -> float:
+        """Matched-onset reward with hold-stability penalties.
+
+        Flow:
+        1. detect robot onsets with `activation & ~prev_activation`
+        2. detect releases with `~activation & prev_activation`
+        3. reward matched GT true onsets for velocity accuracy
+        4. penalize an onset if the score says the key should already be held
+        5. penalize a release if the score still expects the key to stay active
+        6. add local contour and short-window bias terms on matched onsets only
+
+        The first couple of control steps are exempt from hold penalties.
+        Twinkle starts with notes that are already active because of
+        `initial_buffer_time`, so penalizing those steps directly makes the
+        reward collapse before the policy even reaches the main phrase.
+        """
+        del physics  # Unused.
+
+        activation = self.piano.activation
+        new_onsets = activation & ~self._prev_activation
+        releases = ~activation & self._prev_activation
+
+        t = self._t_idx - 1
+        penalize_hold_stability = t >= _VELOCITY_V2_HOLD_PENALTY_GRACE_STEPS
+        gt_active_velocity_map = self._score_active_velocity_map(t)
+        gt_true_onset_velocity_map = self._score_true_onset_velocity_map(t)
+
+        matched_robot_vels: List[int] = []
+        matched_gt_vels: List[int] = []
+        abs_rewards: List[float] = []
+        unexpected_hold_onset_count = 0
+
+        for key in np.flatnonzero(new_onsets):
+            key_id = int(key)
+            gt_vel = gt_true_onset_velocity_map.get(key_id)
+            if gt_vel is None:
+                # This branch captures the exact failure mode we saw in traces:
+                # the score still wants the note to be active, but the robot
+                # created a fresh onset instead of smoothly keeping it held.
+                if penalize_hold_stability and key_id in gt_active_velocity_map:
+                    unexpected_hold_onset_count += 1
+                continue
+
+            robot_qvel = float(self.piano._onset_velocities[key])
+            robot_midi_vel = (
+                int(
+                    np.clip(
+                        (robot_qvel - _QVEL_MIN) / (_MAX_KEY_VEL - _QVEL_MIN) * 126,
+                        0,
+                        126,
+                    )
+                )
+                + 1
+            )
+
+            lo = max(1, gt_vel - 3)
+            hi = min(127, gt_vel + 3)
+            abs_accuracy = tolerance(
+                robot_midi_vel,
+                bounds=(lo, hi),
+                margin=20,
+                sigmoid="gaussian",
+                value_at_margin=0.05,
+            )
+
+            matched_robot_vels.append(robot_midi_vel)
+            matched_gt_vels.append(gt_vel)
+            abs_rewards.append(2.0 * float(abs_accuracy) - 1.0)
+
+        premature_release_count = (
+            sum(
+                1
+                for key in np.flatnonzero(releases)
+                if int(key) in gt_active_velocity_map
+            )
+            if penalize_hold_stability
+            else 0
+        )
+
+        abs_reward = float(np.mean(abs_rewards)) if abs_rewards else 0.0
+
+        # Chords produce multiple onsets in one step, so v2 first compresses that
+        # step to a mean velocity before comparing it against recent history.
+        if not matched_robot_vels:
+            contour_reward = 0.0
+            bias_reward = 0.0
+            extreme_weight = 1.0
+        else:
+            step_robot_mean = float(np.mean(matched_robot_vels))
+            step_gt_mean = float(np.mean(matched_gt_vels))
+            step_error = step_robot_mean - step_gt_mean
+
+            if (
+                self._prev_velocity_reward_robot_mean is None
+                or self._prev_velocity_reward_gt_mean is None
+            ):
+                contour_reward = 0.0
+            else:
+                robot_delta = step_robot_mean - self._prev_velocity_reward_robot_mean
+                gt_delta = step_gt_mean - self._prev_velocity_reward_gt_mean
+                if abs(gt_delta) < 4.0:
+                    contour_reward = 0.0
+                else:
+                    contour_reward = float(
+                        np.tanh(robot_delta / 8.0) * np.tanh(gt_delta / 8.0)
+                    )
+
+            if len(self._recent_velocity_reward_errors) < 2:
+                bias_reward = 0.0
+            else:
+                recent_errors = self._recent_velocity_reward_errors + [step_error]
+                recent_bias = float(np.mean(recent_errors))
+                bias_reward = -min(abs(recent_bias) / 15.0, 1.0)
+
+            extreme_weight = float(
+                np.mean(
+                    [
+                        1.0
+                        + 0.5
+                        * min(abs(gt_vel - self._piece_velocity_median) / 20.0, 1.0)
+                        for gt_vel in matched_gt_vels
+                    ]
+                )
+            )
+
+            self._prev_velocity_reward_robot_mean = step_robot_mean
+            self._prev_velocity_reward_gt_mean = step_gt_mean
+            self._recent_velocity_reward_errors.append(step_error)
+            if len(self._recent_velocity_reward_errors) > 4:
+                self._recent_velocity_reward_errors.pop(0)
+
+        hold_stability_penalty = (
+            _VELOCITY_V2_UNEXPECTED_HOLD_ONSET_PENALTY * unexpected_hold_onset_count
+            + _VELOCITY_V2_PREMATURE_RELEASE_PENALTY * premature_release_count
+        )
+
+        raw_reward = extreme_weight * (
+            abs_reward
+            + 0.35 * contour_reward
+            + 0.15 * bias_reward
+        ) - hold_stability_penalty
+        clipped_reward = float(np.clip(raw_reward, -1.5, 1.5))
+        return self._velocity_reward_coef * clipped_reward
 
     def _compute_fingering_reward(self, physics: mjcf.Physics) -> float:
         """Reward for minimizing the distance between the fingers and the keys."""
@@ -388,6 +880,39 @@ class PianoWithShadowHands(base.PianoTask):
             self._goal_state[i, keys] = 1.0
             self._goal_state[i, -1] = self._sustains[t]
 
+    def _update_velocity_goal_state(self) -> None:
+        if self._t_idx == len(self._notes):
+            return
+        self._velocity_goal_state = np.zeros(
+            (self._n_steps_velocity_lookahead + 1, self.piano.n_keys),
+            dtype=np.float64,
+        )
+        t_start = self._t_idx
+        t_end = min(t_start + self._n_steps_velocity_lookahead + 1, len(self._notes))
+        for i, t in enumerate(range(t_start, t_end)):
+            for note in self._notes[t]:
+                self._velocity_goal_state[i, note.key] = note.velocity / 127.0
+
+    def _get_velocity_scaled_goal_state(self) -> np.ndarray:
+        """Goal state with velocity scaling instead of binary 1.0.
+
+        Same shape as the regular goal state: (n_steps_lookahead+1, n_keys+1).
+        Where the regular goal has 1.0 for a pressed key, this has velocity/127.
+        The sustain dimension (last) stays binary, as sustain has no velocity.
+        Returns zeros if the episode is ending.
+        """
+        n = self._n_steps_lookahead + 1
+        result = np.zeros((n, self.piano.n_keys + 1), dtype=np.float64)
+        if self._t_idx == len(self._notes):
+            return result
+        t_start = self._t_idx
+        t_end = min(t_start + n, len(self._notes))
+        for i, t in enumerate(range(t_start, t_end)):
+            for note in self._notes[t]:
+                result[i, note.key] = note.velocity / 127.0
+            result[i, -1] = self._sustains[t]
+        return result
+
     def _update_fingering_state(self) -> None:
         if self._t_idx == len(self._notes):
             return
@@ -411,6 +936,26 @@ class PianoWithShadowHands(base.PianoTask):
             for key, mjcf_fingering in keys:
                 self._fingering_state[hand, mjcf_fingering] = 1.0
 
+    def _get_fingering_velocity_state(self) -> np.ndarray:
+        """Returns per-finger target velocities for the current timestep."""
+        state = np.zeros((2, 5), dtype=np.float64)
+        if self._t_idx == len(self._notes):
+            return state
+
+        for note in self._notes[self._t_idx]:
+            finger = note.fingering
+            if finger < 0:
+                continue
+            if finger < 5:
+                hand = 0
+                hand_finger = finger
+            else:
+                hand = 1
+                hand_finger = finger - 5
+
+            state[hand, hand_finger] = max(state[hand, hand_finger], note.velocity / 127.0)
+        return state
+
     def _add_observables(self) -> None:
         # Enable hand observables.
         enabled_observables = [
@@ -420,6 +965,7 @@ class PianoWithShadowHands(base.PianoTask):
             # slider joints (which are in units of meters).
             # "position",
         ]
+        enabled_observables.append("joints_vel")
         for hand in [self.right_hand, self.left_hand]:
             for obs in enabled_observables:
                 getattr(hand.observables, obs).enabled = True
@@ -428,11 +974,12 @@ class PianoWithShadowHands(base.PianoTask):
         self.piano.observables.state.enabled = True
         self.piano.observables.sustain_state.enabled = True
 
-        # This returns the goal state for the current timestep and n steps ahead.
+        # Goal state: binary 1.0 entries replaced by velocity/127 (scaled_goal).
+        # _goal_state stays binary for reward computation.
         def _get_goal_state(physics) -> np.ndarray:
             del physics  # Unused.
             self._update_goal_state()
-            return self._goal_state.ravel()
+            return self._get_velocity_scaled_goal_state().ravel()
 
         goal_observable = observable.Generic(_get_goal_state)
         goal_observable.enabled = True
@@ -447,6 +994,33 @@ class PianoWithShadowHands(base.PianoTask):
         fingering_observable = observable.Generic(_get_fingering_state)
         fingering_observable.enabled = not self._disable_fingering_reward
         self._task_observables["fingering"] = fingering_observable
+
+        def _get_fingering_velocity_state(physics) -> np.ndarray:
+            del physics  # Unused.
+            return self._get_fingering_velocity_state().ravel()
+
+        fingering_velocity_observable = observable.Generic(_get_fingering_velocity_state)
+        fingering_velocity_observable.enabled = False
+        self._task_observables["fingering_velocity"] = fingering_velocity_observable
+
+        # Compact residual obs: velocity lookahead + piano state + hand kinematics.
+        # Appended at the END of the obs vector so obs[:base_obs_dim] stays intact.
+        # Shape: (n_steps_velocity_lookahead+1)*88 + 88 + 1 + 23*4 = 621 (default 4-step).
+        if self._compact_residual_obs:
+            def _get_compact_residual_obs(physics) -> np.ndarray:
+                self._update_velocity_goal_state()
+                vel = self._velocity_goal_state.ravel()
+                piano_state = self.piano._state.copy()
+                sustain = self.piano._sustain_state.copy()
+                rh_pos = physics.bind(self.right_hand.joints).qpos.copy()
+                lh_pos = physics.bind(self.left_hand.joints).qpos.copy()
+                rh_vel = physics.bind(self.right_hand.joints).qvel.copy()
+                lh_vel = physics.bind(self.left_hand.joints).qvel.copy()
+                return np.concatenate([vel, piano_state, sustain, rh_pos, lh_pos, rh_vel, lh_vel])
+
+            compact_obs = observable.Generic(_get_compact_residual_obs)
+            compact_obs.enabled = True
+            self._task_observables["compact_residual_obs"] = compact_obs
 
     def _colorize_fingertips(self) -> None:
         """Colorize the fingertips of the hands."""

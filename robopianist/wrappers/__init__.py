@@ -13,10 +13,12 @@
 # limitations under the License.
 
 from robopianist.wrappers.evaluation import MidiEvaluationWrapper
+from robopianist.wrappers.lagrangian import LagrangianVelocityWrapper
 from robopianist.wrappers.pixels import PixelWrapper
 from robopianist.wrappers.sound import PianoSoundVideoWrapper
 
 __all__ = [
+    "LagrangianVelocityWrapper",
     "MidiEvaluationWrapper",
     "PianoSoundVideoWrapper",
     "PixelWrapper",

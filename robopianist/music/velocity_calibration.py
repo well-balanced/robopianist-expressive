@@ -24,16 +24,24 @@ _DEFAULT_NPZ = Path(__file__).parent / "velocity_calibration.npz"
 
 
 class VelocityCalibration:
-    """Lookup table: MIDI velocity (1–127) → normalized loudness (0–1).
+    """Lookup table: MIDI velocity (1–127) → normalized loudness.
+
+    Two scales are available:
+        table:    linear RMS amplitude, normalized to [0, 1].
+        table_db: dB-scale loudness (20*log10(rms)), normalized to [0, 1].
+                  Matches human perception more closely; roughly uniform
+                  gradient across the full velocity range.
 
     Attributes:
-        table: ndarray of shape (127,) where table[i] is the loudness for
-               MIDI velocity i+1. Values are in [0, 1].
+        table:    ndarray (127,) — linear RMS loudness, index 0 = velocity 1.
+        table_db: ndarray (127,) — dB loudness, same indexing.
     """
 
-    def __init__(self, table: np.ndarray) -> None:
-        assert table.shape == (127,), f"Expected shape (127,), got {table.shape}"
+    def __init__(self, table: np.ndarray, table_db: np.ndarray) -> None:
+        assert table.shape == (127,)
+        assert table_db.shape == (127,)
         self.table = table.astype(np.float64)
+        self.table_db = table_db.astype(np.float64)
 
     # ------------------------------------------------------------------
     # Construction
@@ -48,31 +56,49 @@ class VelocityCalibration:
         if rms_max == 0:
             raise ValueError("Calibration RMS values are all zero.")
         table = np.clip(rms_fitted / rms_max, 0.0, 1.0)
-        return cls(table)
+
+        # dB scale: 20*log10(rms), normalized so that velocity=127 → 1.0
+        _EPS = 1e-9
+        db = 20.0 * np.log10(np.clip(rms_fitted, _EPS, None))
+        db_min, db_max = db.min(), db.max()
+        table_db = (db - db_min) / (db_max - db_min)
+
+        return cls(table, table_db)
 
     # ------------------------------------------------------------------
     # Core lookup
     # ------------------------------------------------------------------
 
+    def _idx(self, velocity: int | float) -> int:
+        return int(np.clip(int(round(float(velocity))) - 1, 0, 126))
+
     def __getitem__(self, velocity: int) -> float:
-        """Return normalized loudness for a MIDI velocity (1–127)."""
-        idx = int(np.clip(velocity - 1, 0, 126))
-        return float(self.table[idx])
+        """Return linear RMS loudness for a MIDI velocity (1–127)."""
+        return float(self.table[self._idx(velocity)])
 
     def loudness(self, velocity: int | float) -> float:
-        """Return normalized loudness for a MIDI velocity (1–127)."""
-        return self[int(round(velocity))]
+        """Return linear RMS loudness for a MIDI velocity (1–127)."""
+        return float(self.table[self._idx(velocity)])
+
+    def loudness_db(self, velocity: int | float) -> float:
+        """Return dB-normalized loudness for a MIDI velocity (1–127).
+
+        Uses 20*log10(rms), normalized to [0, 1]. Matches human perception
+        more closely than the linear scale — gradient is roughly uniform
+        across the full velocity range.
+        """
+        return float(self.table_db[self._idx(velocity)])
 
     # ------------------------------------------------------------------
     # RL reward
     # ------------------------------------------------------------------
 
     def reward(self, achieved_vel: int | float, target_vel: int | float) -> float:
-        """Squared loudness error in [-1, 0].
+        """Squared dB-loudness error in [-1, 0].
 
-        Returns -(loudness(achieved) - loudness(target))^2.
-        Zero means perfect loudness match; -1 is the worst possible error
-        (e.g., silent vs. full-volume).
+        Returns -(loudness_db(achieved) - loudness_db(target))^2.
+        Zero means perfect loudness match; -1 is the worst possible error.
+        Uses the dB scale for perceptually uniform gradient.
         """
-        delta = self.loudness(achieved_vel) - self.loudness(target_vel)
-        return -float(delta * delta)
+        delta = self.loudness_db(achieved_vel) - self.loudness_db(target_vel)
+        return -float(abs(delta))
